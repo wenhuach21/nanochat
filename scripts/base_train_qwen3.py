@@ -631,7 +631,7 @@ while True:
         #     group["weight_decay"] = muon_weight_decay
     for group in muon_optimizer.param_groups:
         group["lr"] = group["initial_lr"] * lrm
-    grad_norm = torch.nn.utils.clip_grad_norm_(model.parameters(), max_norm=2.0)
+    grad_norm = torch.nn.utils.clip_grad_norm_(model.parameters(), max_norm=1.0)
     optimizer.step()
     muon_optimizer.step()
     model.zero_grad(set_to_none=True)
