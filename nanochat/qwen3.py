@@ -4,7 +4,6 @@
 #             the file from the modular. If any change should be done, please apply the change to the
 #                          modular_qwen3.py file directly. One of our CI enforces this.
 #                🚨🚨🚨🚨🚨🚨🚨🚨🚨🚨🚨🚨🚨🚨🚨🚨🚨🚨🚨🚨🚨🚨🚨🚨🚨🚨🚨🚨🚨🚨🚨🚨🚨🚨🚨🚨🚨🚨🚨🚨🚨🚨🚨🚨🚨🚨🚨🚨
-# coding=utf-8
 # Copyright 2025 The Qwen team, Alibaba Group and the HuggingFace Inc. team. All rights reserved.
 #
 # Licensed under the Apache License, Version 2.0 (the "License");
@@ -19,7 +18,8 @@
 # See the License for the specific language governing permissions and
 # limitations under the License.
 
-from typing import Callable, Optional, Union
+from collections.abc import Callable
+from typing import Optional
 
 import torch
 from torch import nn
@@ -42,12 +42,11 @@ from transformers.modeling_utils import ALL_ATTENTION_FUNCTIONS, PreTrainedModel
 from transformers.processing_utils import Unpack
 from transformers.utils import TransformersKwargs, auto_docstring, can_return_tuple
 from transformers.utils.generic import maybe_autocast, merge_with_config_defaults
-from transformers.utils.deprecation import deprecate_kwarg
+from transformers.utils.output_capturing import capture_outputs
 from transformers.models.qwen3.configuration_qwen3 import Qwen3Config
-import torch.nn.functional as F
 
 
-# #@use_kernel_forward_from_hub("RMSNorm")
+@use_kernel_forward_from_hub("RMSNorm")
 class Qwen3RMSNorm(nn.Module):
     def __init__(self, hidden_size, eps: float = 1e-6) -> None:
         """
@@ -67,28 +66,6 @@ class Qwen3RMSNorm(nn.Module):
     def extra_repr(self):
         return f"{tuple(self.weight.shape)}, eps={self.variance_epsilon}"
 
-# class Qwen3RMSNorm(nn.Module):
-#     def __init__(self, hidden_size, eps: float = 1e-6) -> None:
-#         super().__init__()
-#
-#     def forward(self, hidden_states):
-#         # Purely functional rmsnorm with no learnable params
-#         return F.rms_norm(hidden_states, (hidden_states.size(-1),))
-
-
-# class Qwen3MLP(nn.Module):
-#     def __init__(self, config):
-#         super().__init__()
-#         self.hidden_size = config.hidden_size
-#         self.intermediate_size = config.intermediate_size
-#         self.up_proj = nn.Linear(self.hidden_size,self.intermediate_size, bias=False)
-#         self.down_proj = nn.Linear(self.intermediate_size, self.hidden_size, bias=False)
-#
-#     def forward(self, x):
-#         x = self.up_proj(x)
-#         x = F.relu(x).square() #Primer Searching for Efficient Transformers for Language Modeling
-#         x = self.down_proj(x)
-#         return x
 
 class Qwen3MLP(nn.Module):
     def __init__(self, config):
@@ -278,7 +255,6 @@ class Qwen3Attention(nn.Module):
         position_embeddings: tuple[torch.Tensor, torch.Tensor],
         attention_mask: torch.Tensor | None,
         past_key_values: Cache | None = None,
-        cache_position: torch.LongTensor | None = None,
         **kwargs: Unpack[FlashAttentionKwargs],
     ) -> tuple[torch.Tensor, torch.Tensor | None]:
         input_shape = hidden_states.shape[:-1]
@@ -292,9 +268,7 @@ class Qwen3Attention(nn.Module):
         query_states, key_states = apply_rotary_pos_emb(query_states, key_states, cos, sin)
 
         if past_key_values is not None:
-            # sin and cos are specific to RoPE models; cache_position needed for the static cache
-            cache_kwargs = {"sin": sin, "cos": cos, "cache_position": cache_position}
-            key_states, value_states = past_key_values.update(key_states, value_states, self.layer_idx, cache_kwargs)
+            key_states, value_states = past_key_values.update(key_states, value_states, self.layer_idx)
 
         attention_interface: Callable = ALL_ATTENTION_FUNCTIONS.get_interface(
             self.config._attn_implementation, eager_attention_forward
@@ -327,7 +301,6 @@ class Qwen3DecoderLayer(GradientCheckpointingLayer):
         self.mlp = Qwen3MLP(config)
         self.input_layernorm = Qwen3RMSNorm(config.hidden_size, eps=config.rms_norm_eps)
         self.post_attention_layernorm = Qwen3RMSNorm(config.hidden_size, eps=config.rms_norm_eps)
-        self.attention_type = config.layer_types[layer_idx]
 
     def forward(
         self,
@@ -336,7 +309,6 @@ class Qwen3DecoderLayer(GradientCheckpointingLayer):
         position_ids: torch.LongTensor | None = None,
         past_key_values: Cache | None = None,
         use_cache: bool | None = False,
-        cache_position: torch.LongTensor | None = None,
         position_embeddings: tuple[torch.Tensor, torch.Tensor] | None = None,
         **kwargs: Unpack[TransformersKwargs],
     ) -> torch.Tensor:
@@ -349,7 +321,6 @@ class Qwen3DecoderLayer(GradientCheckpointingLayer):
             position_ids=position_ids,
             past_key_values=past_key_values,
             use_cache=use_cache,
-            cache_position=cache_position,
             position_embeddings=position_embeddings,
             **kwargs,
         )
@@ -394,18 +365,15 @@ class Qwen3Model(Qwen3PreTrainedModel):
             [Qwen3DecoderLayer(config, layer_idx) for layer_idx in range(config.num_hidden_layers)]
         )
         self.norm = Qwen3RMSNorm(config.hidden_size, eps=config.rms_norm_eps)
-        # self.pre_norm = Qwen3RMSNorm(config.hidden_size, eps=config.rms_norm_eps)
         self.rotary_emb = Qwen3RotaryEmbedding(config=config)
         self.gradient_checkpointing = False
         self.has_sliding_layers = "sliding_attention" in self.config.layer_types
-        # self.resid_lambdas = nn.Parameter(torch.ones(config.num_hidden_layers))
-        # self.x0_lambdas = nn.Parameter(torch.zeros(config.num_hidden_layers))
+
         # Initialize weights and apply final processing
         self.post_init()
 
-
     @merge_with_config_defaults
-    # @capture_outputs
+    @capture_outputs
     @auto_docstring
     def forward(
         self,
@@ -415,7 +383,6 @@ class Qwen3Model(Qwen3PreTrainedModel):
         past_key_values: Cache | None = None,
         inputs_embeds: torch.FloatTensor | None = None,
         use_cache: bool | None = None,
-        cache_position: torch.LongTensor | None = None,
         **kwargs: Unpack[TransformersKwargs],
     ) -> BaseModelOutputWithPast:
         if (input_ids is None) ^ (inputs_embeds is not None):
@@ -427,14 +394,10 @@ class Qwen3Model(Qwen3PreTrainedModel):
         if use_cache and past_key_values is None:
             past_key_values = DynamicCache(config=self.config)
 
-        if cache_position is None:
-            past_seen_tokens = past_key_values.get_seq_length() if past_key_values is not None else 0
-            cache_position = torch.arange(
-                past_seen_tokens, past_seen_tokens + inputs_embeds.shape[1], device=inputs_embeds.device
-            )
-
         if position_ids is None:
-            position_ids = cache_position.unsqueeze(0)
+            past_seen_tokens = past_key_values.get_seq_length() if past_key_values is not None else 0
+            position_ids = torch.arange(inputs_embeds.shape[1], device=inputs_embeds.device) + past_seen_tokens
+            position_ids = position_ids.unsqueeze(0)
 
         # It may already have been prepared by e.g. `generate`
         if not isinstance(causal_mask_mapping := attention_mask, dict):
@@ -443,7 +406,6 @@ class Qwen3Model(Qwen3PreTrainedModel):
                 "config": self.config,
                 "inputs_embeds": inputs_embeds,
                 "attention_mask": attention_mask,
-                "cache_position": cache_position,
                 "past_key_values": past_key_values,
                 "position_ids": position_ids,
             }
@@ -456,22 +418,19 @@ class Qwen3Model(Qwen3PreTrainedModel):
                 causal_mask_mapping["sliding_attention"] = create_sliding_window_causal_mask(**mask_kwargs)
 
         hidden_states = inputs_embeds
-        # hidden_states = self.pre_norm(hidden_states)
         position_embeddings = self.rotary_emb(hidden_states, position_ids)
 
-        # x0 = hidden_states  # save initial normalized embedding for x0 residual
         for i, decoder_layer in enumerate(self.layers[: self.config.num_hidden_layers]):
-            # hidden_states= self.resid_lambdas[i] * hidden_states + self.x0_lambdas[i] * x0
             hidden_states = decoder_layer(
                 hidden_states,
-                attention_mask=causal_mask_mapping[decoder_layer.attention_type],
+                attention_mask=causal_mask_mapping[self.config.layer_types[i]],
                 position_embeddings=position_embeddings,
                 position_ids=position_ids,
                 past_key_values=past_key_values,
                 use_cache=use_cache,
-                cache_position=cache_position,
                 **kwargs,
             )
+
         hidden_states = self.norm(hidden_states)
         return BaseModelOutputWithPast(
             last_hidden_state=hidden_states,
@@ -494,31 +453,23 @@ class Qwen3ForCausalLM(Qwen3PreTrainedModel, GenerationMixin):
         # Initialize weights and apply final processing
         self.post_init()
 
-    @torch.no_grad()
-    def re_init_weights(self):
-        # torch.nn.init.normal_(self.transformer.wte.weight, mean=0.0, std=1.0)
-        # torch.nn.init.normal_(self.lm_head.weight, mean=0.0, std=0.001)
-        for n,m in self.named_modules():
-            if isinstance(m,torch.nn.Embedding):
-                torch.nn.init.normal_(m.weight, mean=0, std=1.0)
-                #torch.nn.init.normal_(m.weight, mean=0, std=0.03)
-            elif "lm_head" in n:
-                torch.nn.init.normal_(m.weight, mean=0, std=0.001)
-            elif "down_proj" in n:
-                torch.nn.init.zeros_(m.weight)
-                # fan_in = m.in_features
-                # s = 3 ** 0.5 * fan_in ** -0.5
-                # torch.nn.init.uniform_(m.weight, -s, s)
-            elif isinstance(m, torch.nn.Linear):
-                fan_in = m.in_features
-                s = 3**0.5 * fan_in**-0.5
-                torch.nn.init.uniform_(m.weight, -s, s)
-        # self.model.resid_lambdas.data.fill_(1.0)  # 1.0 => typical residual connections at init
-        # self.model.x0_lambdas.data.fill_(0.1)  # 0.1 => small initial weight for skip connection to input embedding
-
-
     def get_device(self):
         return self.device
+
+    # def forward(self, idx, targets=None, kv_cache=None, loss_reduction='mean'):
+    #     logits = self.forward1(idx,labels=targets)
+    #     logits = logits.float()
+    #
+    #     if targets is not None:
+    #         # training: given the targets, compute and return the loss
+    #         # TODO experiment with chunked cross-entropy?
+    #         import torch.nn.functional as F
+    #         loss = F.cross_entropy(logits.view(-1, logits.size(-1)), targets.view(-1), ignore_index=-1,
+    #                                reduction=loss_reduction)
+    #         return loss
+    #     else:
+    #         # inference: just return the logits directly
+    #         return logits
 
     def forward(self, idx, targets=None, kv_cache=None, loss_reduction='mean'):
         logits = self.forward1(idx,labels=targets)
@@ -538,15 +489,47 @@ class Qwen3ForCausalLM(Qwen3PreTrainedModel, GenerationMixin):
             # inference: just return the logits directly
             return logits
 
-        # if targets is not None:
-        #     return res.loss
-        # else:
-        #     logits = res.logits
-        #     logits = logits.float()  # switch to fp32 for logit softcap and loss computation
-        #     softcap = 15  # smoothly cap the logits to the range [-softcap, softcap]
-        #     logits = softcap * torch.tanh(logits / softcap)  # squash the logits
-        #     # inference: just return the logits directly
-        #     return logits
+    @torch.no_grad()
+    def re_init_weights(self):
+        # torch.nn.init.normal_(self.transformer.wte.weight, mean=0.0, std=1.0)
+        # torch.nn.init.normal_(self.lm_head.weight, mean=0.0, std=0.001)
+        for n,m in self.named_modules():
+            if isinstance(m,torch.nn.Embedding):
+                torch.nn.init.normal_(m.weight, mean=0, std=1.0)
+                #torch.nn.init.normal_(m.weight, mean=0, std=0.03)
+            elif "lm_head" in n:
+                torch.nn.init.normal_(m.weight, mean=0, std=0.001)
+            elif "down_proj" in n:
+                torch.nn.init.zeros_(m.weight)
+                # fan_in = m.in_features
+                # s = 3 ** 0.5 * fan_in ** -0.5
+                # torch.nn.init.uniform_(m.weight, -s, s)
+            elif isinstance(m, torch.nn.Linear):
+                fan_in = m.in_features
+                s = 3**0.5 * fan_in**-0.5
+                torch.nn.init.uniform_(m.weight, -s, s)
+
+    # @torch.no_grad()
+    # def re_init_weights(self):
+    #     # torch.nn.init.normal_(self.transformer.wte.weight, mean=0.0, std=1.0)
+    #     # torch.nn.init.normal_(self.lm_head.weight, mean=0.0, std=0.001)
+    #     for n,m in self.named_modules():
+    #         if isinstance(m,torch.nn.Embedding):
+    #             torch.nn.init.normal_(m.weight, mean=0, std=0.02)
+    #         # elif "lm_head" in n: # tield
+    #         #     torch.nn.init.normal_(m.weight, mean=0, std=0.001)
+    #         elif "down_proj" in n or "o_proj" in n :
+    #             fan_in = m.in_features
+    #             # torch.nn.init.zeros_(m.weight)
+    #             # s = 3**0.5* fan_in**-0.5/2/28
+    #             # torch.nn.init.uniform_(m.weight, -s, s)
+    #             # fan_in = m.in_features
+    #             s = 3 ** 0.5 * fan_in ** -0.5
+    #             torch.nn.init.uniform_(m.weight, -s, s)
+    #         elif isinstance(m, torch.nn.Linear):
+    #             fan_in = m.in_features
+    #             s = 3**0.5 * fan_in**-0.5 # avoid outlier
+    #             torch.nn.init.uniform_(m.weight, -s, s)
 
 
     @can_return_tuple
@@ -560,7 +543,6 @@ class Qwen3ForCausalLM(Qwen3PreTrainedModel, GenerationMixin):
         inputs_embeds: torch.FloatTensor | None = None,
         labels: torch.LongTensor | None = None,
         use_cache: bool | None = None,
-        cache_position: torch.LongTensor | None = None,
         logits_to_keep: int | torch.Tensor = 0,
         **kwargs: Unpack[TransformersKwargs],
     ) -> CausalLMOutputWithPast:
@@ -593,7 +575,6 @@ class Qwen3ForCausalLM(Qwen3PreTrainedModel, GenerationMixin):
             past_key_values=past_key_values,
             inputs_embeds=inputs_embeds,
             use_cache=use_cache,
-            cache_position=cache_position,
             **kwargs,
         )
 
@@ -602,19 +583,6 @@ class Qwen3ForCausalLM(Qwen3PreTrainedModel, GenerationMixin):
         slice_indices = slice(-logits_to_keep, None) if isinstance(logits_to_keep, int) else logits_to_keep
         logits = self.lm_head(hidden_states[:, slice_indices, :])
         return logits
-
-        #
-        # loss = None
-        # if labels is not None:
-        #     loss = self.loss_function(logits=logits, labels=labels, vocab_size=self.config.vocab_size, **kwargs)
-        #
-        # return CausalLMOutputWithPast(
-        #     loss=loss,
-        #     logits=logits,
-        #     past_key_values=outputs.past_key_values,
-        #     hidden_states=outputs.hidden_states,
-        #     attentions=outputs.attentions,
-        # )
 
 
 class Qwen3ForSequenceClassification(GenericForSequenceClassification, Qwen3PreTrainedModel):
