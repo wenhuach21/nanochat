@@ -48,8 +48,9 @@ parser.add_argument("--device-type", type=str, default="", help="cuda|cpu|mps (e
 parser.add_argument("--fp8", action="store_true", help="enable FP8 training (requires H100+ GPU and torchao)")
 parser.add_argument("--fp8-recipe", type=str, default="tensorwise", choices=["rowwise", "tensorwise"], help="FP8 scaling recipe: tensorwise (faster, recommended) or rowwise (more accurate but slower)")
 # Model architecture
-parser.add_argument("--depth", type=int, default=12, help="depth of the Transformer model")
-parser.add_argument("--aspect-ratio", type=int, default=64, help="model_dim = depth * aspect_ratio")
+parser.add_argument("--depth", type=int, default=14, help="depth of the Transformer model")
+# parser.add_argument("--aspect-ratio", type=int, default=64, help="model_dim = depth * aspect_ratio")
+parser.add_argument("--hidden-size", type=int, default=1024, help="hidden size")
 parser.add_argument("--head-dim", type=int, default=128, help="target head dimension for attention")
 parser.add_argument("--max-seq-len", type=int, default=2048, help="max context length")
 parser.add_argument("--window-pattern", type=str, default="SSSL", help="sliding window pattern tiled across layers: L=full, S=half context (e.g. 'SSL')")
@@ -58,16 +59,16 @@ parser.add_argument("--num-iterations", type=int, default=-1, help="explicit num
 parser.add_argument("--target-flops", type=float, default=-1.0, help="calculate num_iterations to reach target_flops (-1 = disable)")
 parser.add_argument("--target-param-data-ratio", type=float, default=10.5, help="calculate num_iterations to maintain data:param ratio (Chinchilla=20, -1 = disable)")
 # Optimization
-parser.add_argument("--device-batch-size", type=int, default=32, help="per-device batch size. good number to reduce to 16,8,4,... if you OOM on VRAM.")
+parser.add_argument("--device-batch-size", type=int, default=16, help="per-device batch size. good number to reduce to 16,8,4,... if you OOM on VRAM.")
 # parser.add_argument("--global-batch-size", type=int, default=256, help="all device batch size. good number to reduce to 16,8,4,... if you OOM on VRAM.")
 parser.add_argument("--total-batch-size", type=int, default=-1, help="total batch size in tokens. decent numbers are e.g. 524288. (-1 = auto-compute optimal)")
 parser.add_argument("--lr", type=float, default=3e-3, help="learning rate for embedding parameters (Adam)")
-# parser.add_argument("--embedding-lr", type=float, default=0.3, help="learning rate for embedding parameters (Adam)")
+parser.add_argument("--embedding-lr", type=float, default=0.3, help="learning rate for embedding parameters (Adam)")
 # parser.add_argument("--unembedding-lr", type=float, default=0.004, help="learning rate for unembedding parameters (Adam)")
 parser.add_argument("--weight-decay", type=float, default=0.2, help="cautious weight decay for the Muon optimizer (for weights)")
-# parser.add_argument("--matrix-lr", type=float, default=0.02, help="learning rate for matrix parameters (Muon)")
+parser.add_argument("--muon-lr", type=float, default=0.02, help="learning rate for matrix parameters (Muon)")
 # parser.add_argument("--scalar-lr", type=float, default=0.5, help="learning rate for scalars (resid_lambdas, x0_lambdas)")
-parser.add_argument("--adam-beta1", type=float, default=0.8, help="Adam beta1 for embedding/unembedding")
+parser.add_argument("--adam-beta1", type=float, default=0.9, help="Adam beta1 for embedding/unembedding")
 parser.add_argument("--adam-beta2", type=float, default=0.95, help="Adam beta2 for embedding/unembedding")
 parser.add_argument("--warmup-ratio", type=float, default=0.0, help="ratio of iterations for LR warmup")
 parser.add_argument("--warmdown-ratio", type=float, default=0.5, help="ratio of iterations for LR warmdown")
@@ -77,8 +78,8 @@ parser.add_argument("--resume-from-step", type=int, default=-1, help="resume tra
 # Evaluation
 parser.add_argument("--eval-every", type=int, default=250, help="evaluate val bpb every N steps (-1 = disable)")
 parser.add_argument("--eval-tokens", type=int, default=40*524288, help="number of tokens to evaluate val loss on")
-parser.add_argument("--core-metric-every", type=int, default=2000, help="evaluate CORE metric every N steps (-1 = disable)")
-parser.add_argument("--core-metric-max-per-task", type=int, default=500, help="examples per task for CORE metric")
+parser.add_argument("--core-metric-every", type=int, default=5000, help="evaluate CORE metric every N steps (-1 = disable)")
+parser.add_argument("--core-metric-max-per-task", type=int, default=-1, help="examples per task for CORE metric")
 parser.add_argument("--sample-every", type=int, default=2000, help="sample from model every N steps (-1 = disable)")
 parser.add_argument("--save-every", type=int, default=-1, help="save checkpoints every N steps (-1 = only at end)")
 # Output
@@ -124,24 +125,6 @@ token_bytes = get_token_bytes(device=device)
 vocab_size = tokenizer.get_vocab_size()
 print0(f"Vocab size: {vocab_size:,}")
 # -----------------------------------------------------------------------------
-# Initialize the Model
-
-# def build_model_meta(depth):
-#     """Build a model on meta device for a given depth (shapes/dtypes only, no data)."""
-#     # Model dim is nudged up to nearest multiple of head_dim for clean division
-#     # (FA3 requires head_dim divisible by 8, and this guarantees head_dim == args.head_dim exactly)
-#     base_dim = depth * args.aspect_ratio
-#     model_dim = ((base_dim + args.head_dim - 1) // args.head_dim) * args.head_dim
-#     num_heads = model_dim // args.head_dim
-#     config = GPTConfig(
-#         sequence_len=args.max_seq_len, vocab_size=vocab_size,
-#         n_layer=depth, n_head=num_heads, n_kv_head=num_heads, n_embd=model_dim,
-#         window_pattern=args.window_pattern,
-#     )
-#     with torch.device("meta"):
-#         model_meta = GPT(config)
-#     return model_meta
-
 def build_model_meta(depth):
     # from transformers import AutoConfig,AutoModelForCausalLM
     # config = AutoConfig.from_pretrained
@@ -150,12 +133,12 @@ def build_model_meta(depth):
     # tie_word_embeddings=Ture
     ## layers= 28
     layers = depth
-    hidden_size = layers*args.aspect_ratio
+    hidden_size = args.hidden_size
     head_dim = args.head_dim
     num_attention_heads = hidden_size//head_dim
     intermediate_size = hidden_size * 3
-    config = Qwen3Config(head_dim=head_dim,hidden_act="silu", hidden_size=hidden_size,initializer_range=0.02,intermediate_size=intermediate_size,max_position_embeddings=args.max_seq_len*10,max_window_layers=layers,model_type="qwen3",
-                num_hidden_layers=layers,num_key_value_heads=num_attention_heads,rms_norm_eps=1e-6,rope_theta=10000,tie_word_embeddings=False,vocab_size=vocab_size,use_cache=False, num_attention_heads=num_attention_heads)
+    config = Qwen3Config(head_dim=head_dim, hidden_act="silu", hidden_size=hidden_size,initializer_range=0.02,intermediate_size=intermediate_size,max_position_embeddings=args.max_seq_len*10,max_window_layers=layers,model_type="qwen3",
+                num_hidden_layers=layers,num_key_value_heads=num_attention_heads,rms_norm_eps=1e-6,tie_word_embeddings=False,vocab_size=vocab_size,use_cache=False, num_attention_heads=num_attention_heads)
     with torch.device("meta"):
         model_meta = Qwen3ForCausalLM(config)
     return model_meta
@@ -287,9 +270,9 @@ print0(f"Parameters: {num_params/1e9:.3f}B")
 
 target_tokens = int(args.target_param_data_ratio * num_params) # optimal tokens for the model we are about to train
 B_REF = 256*2048
-d12_model = build_model_meta(12)
-d12_params = sum(p.numel() for p in d12_model.parameters())
-D_REF = num_params/ d12_params # TODO this is different from origin
+d14_model = build_model_meta(14)
+d14_params = sum(p.numel() for p in d14_model.parameters())
+D_REF = num_params/ d14_params # TODO this is different from origin
 total_batch_size = args.total_batch_size # user-provided override is possible
 if total_batch_size == -1:
     batch_size_ratio =  D_REF
@@ -313,13 +296,13 @@ if total_batch_size == -1:
 
 # 3) Knowing the batch size, we can now calculate a learning rate correction (bigger batch size allows higher learning rates)
 batch_lr_scale = 1.0
-batch_ratio = total_batch_size / B_REF # B/B_ref
-if batch_ratio != 1.0:
-    # SGD: linear scaling with batch size is standard (not used in nanochat)
-    # AdamW: sqrt scaling is standard: η ∝ √(B/B_ref)
-    # Muon: we will use the same scaling for Muon as for AdamW: η ∝ √(B/B_ref) (not studied carefully, assumption!)
-    batch_lr_scale = batch_ratio ** 0.5 # η ∝ √(B/B_ref)
-    print0(f"Scaling LRs by {batch_lr_scale:.4f} for batch size {total_batch_size:,} (reference: {B_REF:,})")
+# batch_ratio = total_batch_size / B_REF # B/B_ref
+# if batch_ratio != 1.0:
+#     # SGD: linear scaling with batch size is standard (not used in nanochat)
+#     # AdamW: sqrt scaling is standard: η ∝ √(B/B_ref)
+#     # Muon: we will use the same scaling for Muon as for AdamW: η ∝ √(B/B_ref) (not studied carefully, assumption!)
+#     batch_lr_scale = batch_ratio ** 0.5 # η ∝ √(B/B_ref)
+#     print0(f"Scaling LRs by {batch_lr_scale:.4f} for batch size {total_batch_size:,} (reference: {B_REF:,})")
 
 # 4) Knowing the batch size and the token horizon, we can now calculate the appropriate weight decay scaling
 # We adopt the T_epoch framework from https://arxiv.org/abs/2405.13698
@@ -331,9 +314,9 @@ if batch_ratio != 1.0:
 # num_scaling_params = get_scaling_params(model)
 # target_tokens = int(args.target_param_data_ratio * num_scaling_params) # optimal tokens for the model we are about to train
 #
-weight_decay_scaled = args.weight_decay * math.sqrt(total_batch_size / B_REF) * (1.0/D_REF)
-if weight_decay_scaled != args.weight_decay:
-    print0(f"Scaling weight decay from {args.weight_decay:.6f} to {weight_decay_scaled:.6f} for depth {args.depth}")
+# weight_decay_scaled = args.weight_decay * math.sqrt(total_batch_size / B_REF) * (1.0/D_REF)
+# if weight_decay_scaled != args.weight_decay:
+#     print0(f"Scaling weight decay from {args.weight_decay:.6f} to {weight_decay_scaled:.6f} for depth {args.depth}")
 #
 # # -----------------------------------------------------------------------------
 # # Initialize the Optimizer (combined MuonAdamW: Muon for matrix params, AdamW for rest)
@@ -352,6 +335,7 @@ batch_size = 256
 # total_batch_size = args.max_seq_len*batch_size
 # num_iterations = 10000 # TODO
 lr = args.lr * batch_lr_scale
+weight_decay_scaled = 1.0
 weight_decay = args.weight_decay* weight_decay_scaled
 # Optimizer
 # Split weights in two groups, one with weight decay and the other not.
@@ -376,7 +360,7 @@ other_params = {}
 no_weight_decay = {"params":[],  "weight_decay": 0.0,}
 default_group = {"params":[]}
 lm_head_params=[]
-muon_lr = 0.02
+muon_lr = args.muon_lr
 for n,m in model.named_parameters():
     if any(nd in n for nd in no_decay):
         no_weight_decay["params"].append(m)
@@ -384,7 +368,7 @@ for n,m in model.named_parameters():
         lm_head_params.append({"params": [m], "lr": lr * base_fan_in ** 0.5, "weight_decay": 0.0, })
 
     elif "embed" in n:
-        embed_params.append({"params":[m],"lr":lr*base_fan_in**0.5,"weight_decay": 0.0,})
+        embed_params.append({"params":[m],"lr":args.embedding_lr, "weight_decay": 0.0,}) # this could be change
     elif "norm" not in n and len(m.shape)==2 and m.shape[-1]!=base_fan_in:
         fan_in = m.shape[-1]
         if fan_in not in other_params:
@@ -401,7 +385,7 @@ optimizer_grouped_parameters.extend(lm_head_params)
 # optimizer_grouped_parameters.append(default_group)
 
 optimizer = torch.optim.AdamW(optimizer_grouped_parameters, lr=lr, weight_decay=weight_decay,
-                              betas=(0.9, 0.95))  # betas are changed by wenhua
+                              betas=(args.adam_beta1, args.adam_beta2))  # betas are changed by wenhua
 
 from nanochat.muon_opt import Muon
 moun_parameters=[]
