@@ -73,6 +73,7 @@ parser.add_argument("--adam-beta2", type=float, default=0.95, help="Adam beta2 f
 parser.add_argument("--warmup-ratio", type=float, default=0.0, help="ratio of iterations for LR warmup")
 parser.add_argument("--warmdown-ratio", type=float, default=0.5, help="ratio of iterations for LR warmdown")
 parser.add_argument("--final-lr-frac", type=float, default=0.0, help="final LR as fraction of initial LR")
+parser.add_argument("--grad-max-norm", type=float, default=-1.0, help="clip-grad-nrom")
 parser.add_argument("--lr-schedule", type=str, default="defalut", choices=["linear", "cosine", "default"], help="LR decay schedule during warmdown: linear or cosine")
 parser.add_argument("--resume-from-step", type=int, default=-1, help="resume training from this step (-1 = disable)")
 # Evaluation
@@ -158,7 +159,7 @@ base_dir = get_base_dir()
 output_dirname = args.model_tag if args.model_tag else f"d{args.depth}" # e.g. d12
 checkpoint_dir = os.path.join(base_dir, "base_checkpoints", output_dirname)
 resuming = args.resume_from_step != -1
-if resuming:
+if resuming:#  TODO this have bugs
     print0(f"Resuming optimization from step {args.resume_from_step}")
     model_data, optimizer_data, meta_data = load_checkpoint(checkpoint_dir, args.resume_from_step, device, load_optimizer=True, rank=ddp_rank)
     model.load_state_dict(model_data, strict=True, assign=True)
@@ -358,9 +359,12 @@ base_fan_in = 1024
 embed_params=[]
 other_params = {}
 no_weight_decay = {"params":[],  "weight_decay": 0.0,}
-default_group = {"params":[]}
-lm_head_params=[]
 muon_lr = args.muon_lr
+matrix_lr = muon_lr if muon_lr>0 else lr
+default_group = {"params":[], "lr":muon_lr}
+lm_head_params=[]
+
+
 for n,m in model.named_parameters():
     if any(nd in n for nd in no_decay):
         no_weight_decay["params"].append(m)
@@ -373,7 +377,7 @@ for n,m in model.named_parameters():
         fan_in = m.shape[-1]
         if fan_in not in other_params:
             dmodel_lr_scale = (fan_in / base_fan_in) ** -0.5
-            other_params[fan_in]={"lr":lr*dmodel_lr_scale,"params":[m]}
+            other_params[fan_in]={"lr":matrix_lr*dmodel_lr_scale,"params":[m]}
         else:
             other_params[fan_in]["params"].append(m)
     else:
@@ -387,12 +391,12 @@ optimizer_grouped_parameters.extend(lm_head_params)
 optimizer = torch.optim.AdamW(optimizer_grouped_parameters, lr=lr, weight_decay=weight_decay,
                               betas=(args.adam_beta1, args.adam_beta2))  # betas are changed by wenhua
 
-from nanochat.muon_opt import Muon
 moun_parameters=[]
 moun_parameters.extend(other_params.values())
 moun_parameters.append(default_group)
 # muon_optimizer = Muon(moun_parameters, weight_decay=args.weight_decay,lr=muon_lr)
-muon_optimizer = Muon(moun_parameters, weight_decay=args.weight_decay, adjust_lr_fn="match_rms_adamw",lr=lr)
+
+muon_optimizer = torch.optim.Muon(moun_parameters, weight_decay=args.weight_decay, adjust_lr_fn="match_rms_adamw",lr=muon_lr)
 for group in optimizer.param_groups:
     group["initial_lr"] = group["lr"]
 for group in muon_optimizer.param_groups:
@@ -593,6 +597,7 @@ while True:
     # evaluate the gradient
     synchronize()
     t0 = time.time()
+
     for micro_step in range(grad_accum_steps):
         with autocast_ctx:
             loss = model(x, y)
@@ -615,7 +620,8 @@ while True:
         #     group["weight_decay"] = muon_weight_decay
     for group in muon_optimizer.param_groups:
         group["lr"] = group["initial_lr"] * lrm
-    grad_norm = torch.nn.utils.clip_grad_norm_(model.parameters(), max_norm=1.0)
+    if args.grad_max_norm>0:
+        grad_norm = torch.nn.utils.clip_grad_norm_(model.parameters(), max_norm=args.grad_max_norm)
     optimizer.step()
     muon_optimizer.step()
     model.zero_grad(set_to_none=True)
