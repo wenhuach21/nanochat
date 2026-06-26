@@ -159,6 +159,8 @@ base_dir = get_base_dir()
 output_dirname = args.model_tag if args.model_tag else f"d{args.depth}" # e.g. d12
 checkpoint_dir = os.path.join(base_dir, "base_checkpoints", output_dirname)
 resuming = args.resume_from_step != -1
+optimizer_data = None
+meta_data = None
 if resuming:#  TODO this have bugs
     print0(f"Resuming optimization from step {args.resume_from_step}")
     model_data, optimizer_data, meta_data = load_checkpoint(checkpoint_dir, args.resume_from_step, device, load_optimizer=True, rank=ddp_rank)
@@ -400,18 +402,29 @@ optimizer_grouped_parameters.extend(lm_head_params)
 optimizer = torch.optim.AdamW(optimizer_grouped_parameters, lr=lr, weight_decay=weight_decay_scaled,
                               betas=(args.adam_beta1, args.adam_beta2),eps=1e-10)  # betas are changed by wenhua
 
-moun_parameters=[]
-moun_parameters.extend(other_params.values())
-moun_parameters.append(default_group)
-# muon_optimizer = Muon(moun_parameters, weight_decay=args.weight_decay,lr=muon_lr)
+# Only create muon_optimizer if muon_lr >= 0
+muon_optimizer = None
+if args.muon_lr >= 0:
+    moun_parameters=[]
+    moun_parameters.extend(other_params.values())
+    moun_parameters.append(default_group)
+    muon_optimizer = torch.optim.Muon(moun_parameters, weight_decay=weight_decay_scaled, adjust_lr_fn="match_rms_adamw",lr=muon_lr)
+    for group in muon_optimizer.param_groups:
+        group["initial_lr"] = group["lr"]
 
-muon_optimizer = torch.optim.Muon(moun_parameters, weight_decay=weight_decay_scaled, adjust_lr_fn="match_rms_adamw",lr=muon_lr)
 for group in optimizer.param_groups:
     group["initial_lr"] = group["lr"]
-for group in muon_optimizer.param_groups:
-    group["initial_lr"] = group["lr"]
+
 if resuming:
-    optimizer.load_state_dict(optimizer_data) # TODO not save
+    # Backward compatible optimizer restore:
+    # - old checkpoints: optimizer_data is AdamW state_dict
+    # - new checkpoints: optimizer_data is {"adamw": ..., "muon": ...}
+    if isinstance(optimizer_data, dict) and "adamw" in optimizer_data:
+        optimizer.load_state_dict(optimizer_data["adamw"])
+        if muon_optimizer is not None and optimizer_data.get("muon") is not None:
+            muon_optimizer.load_state_dict(optimizer_data["muon"])
+    else:
+        optimizer.load_state_dict(optimizer_data)
     del optimizer_data
 
 # -----------------------------------------------------------------------------
@@ -574,28 +587,48 @@ while True:
 
     # save checkpoint: at the end of the run, or every save_every steps, except at the first step or the resume step
     if last_step or (step > 0 and step != args.resume_from_step and args.save_every > 0 and step % args.save_every == 0):
-        save_checkpoint(
-            checkpoint_dir,
-            step,
-            orig_model.state_dict(), # model parameters
-            optimizer.state_dict(), # optimizer state
-            { # metadata saved as json
-                "step": step,
-                "val_bpb": val_bpb, # loss at last step
-                # "model_config": model_config_kwargs,
-                "user_config": user_config, # inputs to the training script
-                "device_batch_size": args.device_batch_size,
-                "max_seq_len": args.max_seq_len,
-                "total_batch_size": total_batch_size,
-                "dataloader_state_dict": dataloader_state_dict,
-                "loop_state": { # all loop state (other than step) so that we can resume training
-                    "min_val_bpb": min_val_bpb,
-                    "smooth_train_loss": smooth_train_loss,
-                    "total_training_time": total_training_time,
-                },
+        meta_dict = { # metadata saved as json
+            "step": step,
+            "val_bpb": val_bpb, # loss at last step
+            # "model_config": model_config_kwargs,
+            "user_config": user_config, # inputs to the training script
+            "device_batch_size": args.device_batch_size,
+            "max_seq_len": args.max_seq_len,
+            "total_batch_size": total_batch_size,
+            "dataloader_state_dict": dataloader_state_dict,
+            "loop_state": { # all loop state (other than step) so that we can resume training
+                "min_val_bpb": min_val_bpb,
+                "smooth_train_loss": smooth_train_loss,
+                "total_training_time": total_training_time,
             },
-            rank=ddp_rank,
-        )
+        }
+        optimizer_state = {
+            "adamw": optimizer.state_dict(),
+            "muon": muon_optimizer.state_dict() if muon_optimizer is not None else None,
+        }
+
+        if ddp:
+            # Save sequentially across ranks to avoid concurrent heavy writes to the same filesystem.
+            for save_rank in range(ddp_world_size):
+                if ddp_rank == save_rank:
+                    save_checkpoint(
+                        checkpoint_dir,
+                        step,
+                        orig_model.state_dict(), # model parameters
+                        optimizer_state, # optimizer state(s), saved via torch.save
+                        meta_dict,
+                        rank=ddp_rank,
+                    )
+                torch.distributed.barrier()
+        else:
+            save_checkpoint(
+                checkpoint_dir,
+                step,
+                orig_model.state_dict(), # model parameters
+                optimizer_state, # optimizer state(s), saved via torch.save
+                meta_dict,
+                rank=ddp_rank,
+            )
 
     # termination conditions (TODO: possibly also add loss explosions etc.)
     if last_step:
@@ -622,23 +655,23 @@ while True:
         x, y, dataloader_state_dict = next(train_loader) # prefetch the next batch while the GPU is busy with forward/backward
     # step the optimizer
     lrm = get_lr_multiplier(step)
-    muon_momentum = get_muon_momentum(step)
-    muon_weight_decay = get_weight_decay(step)
     for group in optimizer.param_groups:
         group["lr"] = group["initial_lr"] * lrm
-    for group in muon_optimizer.param_groups:
-        group["momentum"] = muon_momentum
-        group["weight_decay"] = muon_weight_decay
 
-        # if group['kind'] == 'muon':
-        #     group["momentum"] = muon_momentum
-        #     group["weight_decay"] = muon_weight_decay
-    for group in muon_optimizer.param_groups:
-        group["lr"] = group["initial_lr"] * lrm
+    # Update muon_optimizer parameters if it exists
+    if muon_optimizer is not None:
+        muon_momentum = get_muon_momentum(step)
+        muon_weight_decay = get_weight_decay(step)
+        for group in muon_optimizer.param_groups:
+            group["momentum"] = muon_momentum
+            group["weight_decay"] = muon_weight_decay
+            group["lr"] = group["initial_lr"] * lrm
+
     if args.grad_max_norm>0:
         grad_norm = torch.nn.utils.clip_grad_norm_(model.parameters(), max_norm=args.grad_max_norm)
     optimizer.step()
-    muon_optimizer.step()
+    if muon_optimizer is not None:
+        muon_optimizer.step()
     model.zero_grad(set_to_none=True)
     train_loss_f = train_loss.item() # .item() is a CPU-GPU sync point
     synchronize()

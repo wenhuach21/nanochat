@@ -6,6 +6,7 @@ import re
 import glob
 import json
 import logging
+import tempfile
 import torch
 
 from nanochat.common import get_base_dir
@@ -39,12 +40,39 @@ def _patch_missing_keys(model_data, model_config):
         model_data["x0_lambdas"] = torch.zeros(n_layer)
         log0(f"Patching missing x0_lambdas in model data to 0.0")
 
+
+def _to_cpu(obj):
+    """Recursively move tensors in a nested structure to CPU for safer checkpoint writes."""
+    if torch.is_tensor(obj):
+        return obj.detach().cpu()
+    if isinstance(obj, dict):
+        return {k: _to_cpu(v) for k, v in obj.items()}
+    if isinstance(obj, list):
+        return [_to_cpu(v) for v in obj]
+    if isinstance(obj, tuple):
+        return tuple(_to_cpu(v) for v in obj)
+    return obj
+
+
+def _atomic_torch_save(obj, path):
+    """Write via a temp file and rename atomically when complete."""
+    directory = os.path.dirname(path) or "."
+    fd, tmp_path = tempfile.mkstemp(prefix=".__tmp_", suffix=".pt", dir=directory)
+    os.close(fd)
+    try:
+        # Use legacy serialization format to avoid occasional inline_container zip writer errors.
+        torch.save(obj, tmp_path, _use_new_zipfile_serialization=False)
+        os.replace(tmp_path, path)
+    finally:
+        if os.path.exists(tmp_path):
+            os.remove(tmp_path)
+
 def save_checkpoint(checkpoint_dir, step, model_data, optimizer_data, meta_data, rank=0):
     if rank == 0:
         os.makedirs(checkpoint_dir, exist_ok=True)
         # Save the model state parameters
         model_path = os.path.join(checkpoint_dir, f"model_{step:06d}.pt")
-        torch.save(model_data, model_path)
+        _atomic_torch_save(_to_cpu(model_data), model_path)
         logger.info(f"Saved model parameters to: {model_path}")
         # Save the metadata dict as json
         meta_path = os.path.join(checkpoint_dir, f"meta_{step:06d}.json")
@@ -55,7 +83,7 @@ def save_checkpoint(checkpoint_dir, step, model_data, optimizer_data, meta_data,
     if optimizer_data is not None:
         os.makedirs(checkpoint_dir, exist_ok=True)
         optimizer_path = os.path.join(checkpoint_dir, f"optim_{step:06d}_rank{rank:d}.pt")
-        torch.save(optimizer_data, optimizer_path)
+        _atomic_torch_save(_to_cpu(optimizer_data), optimizer_path)
         logger.info(f"Saved optimizer state to: {optimizer_path}")
 
 def load_checkpoint(checkpoint_dir, step, device, load_optimizer=False, rank=0):
