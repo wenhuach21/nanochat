@@ -379,7 +379,7 @@ for n,m in model.named_parameters():
     if any(nd in n for nd in no_decay):
         no_weight_decay["params"].append(m)
     elif "lm_head" in n:
-        lm_head_params.append({"params": [m], "lr": args.unembedding_lr, "weight_decay": 0.0, })
+        lm_head_params.append({"params": [m], "lr": args.lr, "weight_decay": 0.0, })
     elif "embed" in n:
         embed_params.append({"params":[m],"lr":args.embedding_lr, "weight_decay": 0.0,}) # this could be change
     elif "norm" not in n and len(m.shape)==2 and m.shape[-1]!=base_fan_in:
