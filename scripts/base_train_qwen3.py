@@ -64,7 +64,7 @@ parser.add_argument("--device-batch-size", type=int, default=16, help="per-devic
 parser.add_argument("--total-batch-size", type=int, default=-1, help="total batch size in tokens. decent numbers are e.g. 524288. (-1 = auto-compute optimal)")
 parser.add_argument("--lr", type=float, default=3e-3, help="learning rate for embedding parameters (Adam)")
 parser.add_argument("--embedding-lr", type=float, default=0.3, help="learning rate for embedding parameters (Adam)")
-# parser.add_argument("--unembedding-lr", type=float, default=0.004, help="learning rate for unembedding parameters (Adam)")
+parser.add_argument("--unembedding-lr", type=float, default=0.004, help="learning rate for unembedding (lm_head) parameters (Adam)")
 parser.add_argument("--weight-decay", type=float, default=0.2, help="cautious weight decay for the Muon optimizer (for weights)")
 parser.add_argument("--muon-lr", type=float, default=0.02, help="learning rate for matrix parameters (Muon)")
 # parser.add_argument("--scalar-lr", type=float, default=0.5, help="learning rate for scalars (resid_lambdas, x0_lambdas)")
@@ -247,7 +247,17 @@ def disable_fp8(model):
 
 orig_model = model # original, uncompiled model, for saving raw model state_dict and for inference/evaluation (because the shapes may change shape)
 # model = torch.compile(model, dynamic=False) # may cause nan issue the inputs to model will never change shape so dynamic=False is safe
-print0(model.dtype)
+print0(orig_model.dtype)
+
+# Wrap the model in DistributedDataParallel for multi-GPU training.
+# CRITICAL: the plain torch.optim.AdamW / torch.optim.Muon used below do NOT synchronize
+# gradients across ranks. Without DDP, every rank would train an independent model on its own
+# data shard and only rank0's (severely under-trained) model would be saved/evaluated.
+# DDP all-reduces (averages) gradients across ranks during backward, fixing this.
+if ddp:
+    from torch.nn.parallel import DistributedDataParallel as DDP
+    model = DDP(model, device_ids=[ddp_local_rank], broadcast_buffers=True)
+    print0(f"Wrapped model in DistributedDataParallel (world_size={ddp_world_size})")
 # -----------------------------------------------------------------------------
 # Scaling laws and muP extrapolations to determine the optimal training horizon, batch size, learning rates, weight decay.
 
@@ -599,11 +609,17 @@ while True:
     t0 = time.time()
 
     for micro_step in range(grad_accum_steps):
-        with autocast_ctx:
-            loss = model(x, y)
-        train_loss = loss.detach() # for logging
-        loss = loss / grad_accum_steps # each .backward() is a grad sum => normalize loss here
-        loss.backward()
+        # Under DDP with gradient accumulation, only synchronize (all-reduce) gradients on the
+        # final micro-step. no_sync() skips the all-reduce on the intermediate micro-steps; the
+        # final backward then reduces the fully-accumulated gradient -> 1 comm per optimizer step.
+        is_last_micro = micro_step == grad_accum_steps - 1
+        sync_ctx = model.no_sync() if (ddp and not is_last_micro) else nullcontext()
+        with sync_ctx:
+            with autocast_ctx:
+                loss = model(x, y)
+            train_loss = loss.detach() # for logging
+            loss = loss / grad_accum_steps # each .backward() is a grad sum => normalize loss here
+            loss.backward()
         x, y, dataloader_state_dict = next(train_loader) # prefetch the next batch while the GPU is busy with forward/backward
     # step the optimizer
     lrm = get_lr_multiplier(step)
