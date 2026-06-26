@@ -336,7 +336,7 @@ batch_size = 256
 # total_batch_size = args.max_seq_len*batch_size
 # num_iterations = 10000 # TODO
 lr = args.lr * batch_lr_scale
-
+weight_decay = args.weight_decay
 weight_decay_scaled = args.weight_decay* 1.0
 # Optimizer
 # Split weights in two groups, one with weight decay and the other not.
@@ -388,7 +388,7 @@ optimizer_grouped_parameters.extend(lm_head_params)
 # optimizer_grouped_parameters.extend(other_params.values())
 # optimizer_grouped_parameters.append(default_group)
 
-optimizer = torch.optim.AdamW(optimizer_grouped_parameters, lr=lr, weight_decay=weight_decay,
+optimizer = torch.optim.AdamW(optimizer_grouped_parameters, lr=lr, weight_decay=weight_decay_scaled,
                               betas=(args.adam_beta1, args.adam_beta2))  # betas are changed by wenhua
 
 moun_parameters=[]
@@ -396,7 +396,7 @@ moun_parameters.extend(other_params.values())
 moun_parameters.append(default_group)
 # muon_optimizer = Muon(moun_parameters, weight_decay=args.weight_decay,lr=muon_lr)
 
-muon_optimizer = torch.optim.Muon(moun_parameters, weight_decay=args.weight_decay, adjust_lr_fn="match_rms_adamw",lr=muon_lr)
+muon_optimizer = torch.optim.Muon(moun_parameters, weight_decay=weight_decay_scaled, adjust_lr_fn="match_rms_adamw",lr=muon_lr)
 for group in optimizer.param_groups:
     group["initial_lr"] = group["lr"]
 for group in muon_optimizer.param_groups:
