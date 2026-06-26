@@ -74,7 +74,7 @@ parser.add_argument("--warmup-ratio", type=float, default=0.0, help="ratio of it
 parser.add_argument("--warmdown-ratio", type=float, default=0.5, help="ratio of iterations for LR warmdown")
 parser.add_argument("--final-lr-frac", type=float, default=0.0, help="final LR as fraction of initial LR")
 parser.add_argument("--grad-max-norm", type=float, default=-1.0, help="clip-grad-nrom")
-parser.add_argument("--lr-schedule", type=str, default="defalut", choices=["linear", "cosine", "default"], help="LR decay schedule during warmdown: linear or cosine")
+parser.add_argument("--lr-schedule", type=str, default="default", choices=["linear", "cosine", "default"], help="LR decay schedule during warmdown: linear or cosine")
 parser.add_argument("--resume-from-step", type=int, default=-1, help="resume training from this step (-1 = disable)")
 # Evaluation
 parser.add_argument("--eval-every", type=int, default=250, help="evaluate val bpb every N steps (-1 = disable)")
@@ -385,11 +385,11 @@ for n,m in model.named_parameters():
         embed_params.append({"params":[m],"lr":args.embedding_lr, "weight_decay": 0.0,}) # this could be change
     elif "norm" not in n and len(m.shape)==2 and m.shape[-1]!=base_fan_in:
         fan_in = m.shape[-1]
-        if fan_in not in other_params:
-            dmodel_lr_scale = (fan_in / base_fan_in) ** -0.5
-            other_params[fan_in]={"lr":matrix_lr*dmodel_lr_scale,"params":[m]}
-        else:
-            other_params[fan_in]["params"].append(m)
+        # if fan_in not in other_params:
+        #     dmodel_lr_scale = (fan_in / base_fan_in) ** -0.5
+        #     other_params[fan_in]={"lr":matrix_lr*dmodel_lr_scale,"params":[m]}
+        # else:
+        other_params[fan_in]["params"].append(m)
     else:
         default_group["params"].append(m)
 optimizer_grouped_parameters.append(no_weight_decay)
@@ -399,7 +399,7 @@ optimizer_grouped_parameters.extend(lm_head_params)
 # optimizer_grouped_parameters.append(default_group)
 
 optimizer = torch.optim.AdamW(optimizer_grouped_parameters, lr=lr, weight_decay=weight_decay_scaled,
-                              betas=(args.adam_beta1, args.adam_beta2))  # betas are changed by wenhua
+                              betas=(args.adam_beta1, args.adam_beta2),eps=1e-10)  # betas are changed by wenhua
 
 moun_parameters=[]
 moun_parameters.extend(other_params.values())

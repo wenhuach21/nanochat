@@ -495,11 +495,11 @@ class Qwen3ForCausalLM(Qwen3PreTrainedModel, GenerationMixin):
         # torch.nn.init.normal_(self.lm_head.weight, mean=0.0, std=0.001)
         for n,m in self.named_modules():
             if isinstance(m,torch.nn.Embedding):
-                torch.nn.init.normal_(m.weight, mean=0, std=1.0)
+                torch.nn.init.normal_(m.weight, mean=0, std=0.02)
                 #torch.nn.init.normal_(m.weight, mean=0, std=0.03)
             elif "lm_head" in n:
                 torch.nn.init.normal_(m.weight, mean=0, std=0.001)
-            elif "down_proj" in n:
+            elif "down_proj" in n or "o_proj" in n:
                 torch.nn.init.zeros_(m.weight)
                 # fan_in = m.in_features
                 # s = 3 ** 0.5 * fan_in ** -0.5
