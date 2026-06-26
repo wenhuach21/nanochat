@@ -9,7 +9,7 @@ from datetime import datetime, timedelta, timezone
 from itertools import product
 from pathlib import Path
 
-LABEL = "Qwen-0625"
+LABEL = "Qwen-0626"
 
 SWEEP_SPACE = {
     "depth": [14],
