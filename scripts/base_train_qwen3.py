@@ -336,8 +336,8 @@ batch_size = 256
 # total_batch_size = args.max_seq_len*batch_size
 # num_iterations = 10000 # TODO
 lr = args.lr * batch_lr_scale
-weight_decay_scaled = 1.0
-weight_decay = args.weight_decay* weight_decay_scaled
+
+weight_decay_scaled = args.weight_decay* 1.0
 # Optimizer
 # Split weights in two groups, one with weight decay and the other not.
 no_decay = ["bias", "norm.weight"]  # norm.weight change by wenhua
@@ -369,7 +369,7 @@ for n,m in model.named_parameters():
     if any(nd in n for nd in no_decay):
         no_weight_decay["params"].append(m)
     elif "lm_head" in n:
-        lm_head_params.append({"params": [m], "lr": lr * base_fan_in ** 0.5, "weight_decay": 0.0, })
+        lm_head_params.append({"params": [m], "lr": lr * base_fan_in ** -0.5, "weight_decay": 0.0, })
 
     elif "embed" in n:
         embed_params.append({"params":[m],"lr":args.embedding_lr, "weight_decay": 0.0,}) # this could be change
