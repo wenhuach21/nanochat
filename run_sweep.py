@@ -15,7 +15,7 @@ SWEEP_SPACE = {
     "depth": [14],
     "lr": [3e-3,3e-4],
     "weight-decay": [0.02],
-    "warmup-ratio":[0.1],
+    "warmup-ratio":[0.05],
     "muon-lr": [0.02,0.002],
     "hidden-size":[1024],
     "embedding-lr":[0.3,0.03],
