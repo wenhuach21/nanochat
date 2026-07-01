@@ -1,12 +1,12 @@
-| time | model                                 | hypeparameters                                                                                                                 | coremetric | loss     | lambada_openai | parameters | flops | commit                                   |   |
-|------|---------------------------------------|--------------------------------------------------------------------------------------------------------------------------------|------------|----------|----------------|------------|-------|------------------------------------------|---|
-|      | nanochat                              |                                                                                                                                | 0.2457     |          |                |            |       |                                          |   |
-| 0624 | d14,hiddensize 876, untiled embedding | lr 3e-3 embedding lr 3e-3 muon_lr 0.02 adaw  betas=(0.9, 0.95), wd ~0.13 step 4688 warmup 0.05 target-param-data-ratio12       |            | 3.13     | 0.2137         | 4687       |       | 26c131d4e0e2832025438ac9a5bfa7033814b909 |   |
-| 0625 | d28 hiddensize 1024 untiled embedding | lr 3e-3,  wd0.02, muon_lr 3e-3, embeddinglr  0.03   betas=(0.9, 0.95)  warmup 0.1  target-param-data-ratio12   steps 10273     | 0.1413     | 2.925588 | 0.2808         |            |       | 4e5ff4213ad3a65558b383c99ab130bf79daf51e |   |
-| 0625 | d28 hiddensize 1024 untiled embedding | lr 3e-3,  wd0.02, muon_lr  3e-3, **embeddinglr  0.3**   betas=(0.9, 0.95)  warmup 0.1  target-param-data-ratio12   steps 10273 | 0.1269     | 2.932613 | 0.2729         |            |       | 4e5ff4213ad3a65558b383c99ab130bf79daf51e |   |
-| 0625 | d28 hiddensize 1024 untiled embedding | lr 3e-3,  wd0.02, muon_lr 3e-3, **embeddinglr  0.03**   betas=(0.9, 0.95)  warmup 0.1  target-param-data-ratio12   steps 10273 | 0.1445     | 2.932555 | 0.2779         |            |       | 4e5ff4213ad3a65558b383c99ab130bf79daf51e |   |
-| 0625 | d14 hiddensize 1024 untiled embedding | lr 3e-3,  wd0.02, muon_lr 3e-3, embeddinglr  0.3   betas=(0.9, 0.95)  warmup 0.1  target-param-data-ratio12   steps 05904      | 0.1202     | 3.087198 | 0.2395         |            |       |                                          |   |
-| 0626 | d14 hiddensize 1024 untied embedding  | lr 3e-3,  wd0.02, muon_lr 2e-2, embeddinglr  0.3   betas=(0.9, 0.95)  warmup 0.0  target-param-data-ratio12   steps 05904      | 0.1524     | 2.814613 | 0.3078         |            |       | 2735b760fd4a16e30524678aa231c748ebbb5ca9 |   |
+| time | model                                 | hypeparameters                                                                                                                               | coremetric | loss     | lambada_openai | parameters | flops | commit                                   |   |
+|------|---------------------------------------|----------------------------------------------------------------------------------------------------------------------------------------------|------------|----------|----------------|------------|-------|------------------------------------------|---|
+|      | nanochat                              |                                                                                                                                              | 0.2457     |          |                |            |       |                                          |   |
+| 0624 | d14,hiddensize 876, untiled embedding | lr 3e-3 embedding lr 3e-3 muon_lr 0.02 adaw  betas=(0.9, 0.95), wd ~0.13 step 4688 warmup 0.05 target-param-data-ratio12                     |            | 3.13     | 0.2137         | 4687       |       | 26c131d4e0e2832025438ac9a5bfa7033814b909 |   |
+| 0625 | d28 hiddensize 1024 untiled embedding | lr 3e-3,  wd0.02, muon_lr 3e-3, embeddinglr  0.03   betas=(0.9, 0.95)  warmup 0.1  target-param-data-ratio12   steps 10273                   | 0.1413     | 2.925588 | 0.2808         |            |       | 4e5ff4213ad3a65558b383c99ab130bf79daf51e |   |
+| 0625 | d28 hiddensize 1024 untiled embedding | lr 3e-3,  wd0.02, muon_lr  3e-3, **embeddinglr  0.3**   betas=(0.9, 0.95)  warmup 0.1  target-param-data-ratio12   steps 10273               | 0.1269     | 2.932613 | 0.2729         |            |       | 4e5ff4213ad3a65558b383c99ab130bf79daf51e |   |
+| 0625 | d28 hiddensize 1024 untiled embedding | lr 3e-3,  wd0.02, muon_lr 3e-3, **embeddinglr  0.03**   betas=(0.9, 0.95)  warmup 0.1  target-param-data-ratio12   steps 10273               | 0.1445     | 2.932555 | 0.2779         |            |       | 4e5ff4213ad3a65558b383c99ab130bf79daf51e |   |
+| 0625 | d14 hiddensize 1024 untiled embedding | lr 3e-3,  wd0.02, muon_lr 3e-3, embeddinglr  0.3   betas=(0.9, 0.95)  warmup 0.1  target-param-data-ratio12   steps 05904                    | 0.1202     | 3.087198 | 0.2395         |            |       |                                          |   |
+| 0626 | d14 hiddensize 1024 untied embedding  | lr 3e-3,  wd0.02, muon_lr 2e-2, embeddinglr  0.3   betas=(0.9, 0.95)  warmup 0.0  target-param-data-ratio12   steps 05904   grad-max-norm -1 | 0.1524     | 2.814613 | 0.3078         |            |       | 2735b760fd4a16e30524678aa231c748ebbb5ca9 |   |
 
 run_datetime_bj,git_commit,depth,lr,weight_decay,warmup_ratio,muon_lr,hidden_size,embedding_lr,target_param_data_ratio,grad_max_norm,params_total,num_iterations,tokens_trained,final_loss,val_bpb,core_score,train_time_sec
 2026-06-25 16:24:
@@ -25,5 +25,47 @@ run_datetime_bj,git_commit,depth,lr,weight_decay,warmup_ratio,muon_lr,hidden_siz
 45,abca99f939da1866e701f138d1cb7486e0d4205c,28,0.003,0.02,0.1,0.02,1024,0.03,12,1.0,0,10273,5386010624,3.08631,,0.1235,16170
 2026-06-26 03:05:
 16,abca99f939da1866e701f138d1cb7486e0d4205c,28,0.003,0.02,0.1,0.002,1024,0.3,12,1.0,0,10273,5386010624,2.91826,,0.1385,16051
+
+
+
+run_datetime_bj,git_commit,depth,lr,weight_decay,warmup_ratio,muon_lr,hidden_size,embedding_lr,target_param_data_ratio,grad_max_norm,params_total,num_iterations,tokens_trained,final_loss,val_bpb,core_score,train_time_sec
+2026-06-26 11:51:34,2735b760fd4a16e30524678aa231c748ebbb5ca9,28,0.003,0.02,0.0,0.02,1024,0.3,12,-1.0,0,10273,5386010624,2.645115,,0.1973,16301
+2026-06-26 16:23:16,2735b760fd4a16e30524678aa231c748ebbb5ca9,28,0.003,0.02,0.0,0.02,1024,0.3,12,1.0,0,10273,5386010624,2.646817,,0.1854,16249
+2026-06-26 20:54:05,2735b760fd4a16e30524678aa231c748ebbb5ca9,28,0.003,0.02,0.0,0.02,1024,0.03,12,-1.0,0,10273,5386010624,2.659375,,0.1906,16215
+2026-06-27 01:24:21,2735b760fd4a16e30524678aa231c748ebbb5ca9,28,0.003,0.02,0.0,0.02,1024,0.03,12,1.0,0,10273,5386010624,2.667186,,0.1889,16270
+2026-06-27 05:55:31,2735b760fd4a16e30524678aa231c748ebbb5ca9,28,0.003,0.02,0.0,0.002,1024,0.3,12,-1.0,0,10273,5386010624,2.655764,,0.2078,16184
+2026-06-27 10:25:16,2735b760fd4a16e30524678aa231c748ebbb5ca9,28,0.003,0.02,0.0,0.002,1024,0.3,12,1.0,0,10273,5386010624,2.655322,,0.1907,16219
+2026-06-27 14:55:35,2735b760fd4a16e30524678aa231c748ebbb5ca9,28,0.003,0.02,0.0,0.002,1024,0.03,12,-1.0,0,10273,5386010624,2.646045,,0.1973,16165
+2026-06-27 19:25:00,2735b760fd4a16e30524678aa231c748ebbb5ca9,28,0.003,0.02,0.0,0.002,1024,0.03,12,1.0,0,10273,5386010624,2.656745,,0.1953,16209
+2026-06-27 23:55:10,2735b760fd4a16e30524678aa231c748ebbb5ca9,28,0.0003,0.02,0.0,0.02,1024,0.3,12,-1.0,0,10273,5386010624,2.679318,,0.1794,16145
+2026-06-28 04:24:15,2735b760fd4a16e30524678aa231c748ebbb5ca9,28,0.0003,0.02,0.0,0.02,1024,0.3,12,1.0,0,10273,5386010624,2.678655,,0.1934,16228
+
+run_datetime_bj,git_commit,depth,lr,weight_decay,warmup_ratio,muon_lr,hidden_size,embedding_lr,target_param_data_ratio,grad_max_norm,params_total,num_iterations,tokens_trained,final_loss,val_bpb,core_score,train_time_sec
+2026-06-28 09:45:06,2735b760fd4a16e30524678aa231c748ebbb5ca9,28,0.003,0.02,0.0,0.02,1024,0.3,24,-1.0,0,20547,10772545536,2.540282,,0.221,61501
+
+run_datetime_bj,git_commit,depth,lr,weight_decay,warmup_ratio,muon_lr,hidden_size,embedding_lr,target_param_data_ratio,grad_max_norm,params_total,num_iterations,tokens_trained,final_loss,val_bpb,core_score,train_time_sec
+2026-06-26 16:29:36,5879c76cdca996eee6f2e794eec0e6a3801d8082,14,0.003,0.02,0.0,0.02,1024,0.3,12,-1.0,0,5904,3095396352,2.813064,,0.1502,15446
+2026-06-26 20:47:03,5879c76cdca996eee6f2e794eec0e6a3801d8082,14,0.003,0.02,0.0,0.02,1024,0.3,12,1.0,0,5904,3095396352,2.813683,,0.1592,15392
+2026-06-27 01:03:35,5879c76cdca996eee6f2e794eec0e6a3801d8082,14,0.003,0.02,0.0,0.02,1024,0.03,12,-1.0,0,5904,3095396352,2.824619,,0.1594,15309
+2026-06-27 05:18:44,5879c76cdca996eee6f2e794eec0e6a3801d8082,14,0.003,0.02,0.0,0.02,1024,0.03,12,1.0,0,5904,3095396352,2.826721,,0.1528,15306
+2026-06-27 09:33:51,5879c76cdca996eee6f2e794eec0e6a3801d8082,14,0.003,0.02,0.0,0.002,1024,0.3,12,-1.0,0,5904,3095396352,2.825657,,0.1505,15299
+2026-06-27 13:48:51,5879c76cdca996eee6f2e794eec0e6a3801d8082,14,0.003,0.02,0.0,0.002,1024,0.3,12,1.0,0,5904,3095396352,2.826833,,0.1538,15328
+2026-06-27 18:04:20,5879c76cdca996eee6f2e794eec0e6a3801d8082,14,0.003,0.02,0.0,0.002,1024,0.03,12,-1.0,0,5904,3095396352,2.817607,,0.1597,15293
+2026-06-27 22:19:13,5879c76cdca996eee6f2e794eec0e6a3801d8082,14,0.003,0.02,0.0,0.002,1024,0.03,12,1.0,0,5904,3095396352,2.818617,,0.1608,15300
+2026-06-28 02:34:14,5879c76cdca996eee6f2e794eec0e6a3801d8082,14,0.0003,0.02,0.0,0.02,1024,0.3,12,-1.0,0,5904,3095396352,2.855471,,0.1234,15296
+2026-06-28 06:49:11,5879c76cdca996eee6f2e794eec0e6a3801d8082,14,0.0003,0.02,0.0,0.02,1024,0.3,12,1.0,0,5904,3095396352,2.85468,,0.1393,15587
+2026-06-28 11:08:59,5879c76cdca996eee6f2e794eec0e6a3801d8082,14,0.0003,0.02,0.0,0.02,1024,0.03,12,-1.0,0,5904,3095396352,2.86003,,0.1446,15286
+2026-06-28 15:23:45,5879c76cdca996eee6f2e794eec0e6a3801d8082,14,0.0003,0.02,0.0,0.02,1024,0.03,12,1.0,0,5904,3095396352,2.862289,,0.1464,15289
+2026-06-28 19:38:35,5879c76cdca996eee6f2e794eec0e6a3801d8082,14,0.0003,0.02,0.0,0.002,1024,0.3,12,-1.0,0,5904,3095396352,2.84895,,0.1464,15293
+2026-06-28 23:53:28,5879c76cdca996eee6f2e794eec0e6a3801d8082,14,0.0003,0.02,0.0,0.002,1024,0.3,12,1.0,0,5904,3095396352,2.848328,,0.15,15303
+2026-06-29 04:08:32,5879c76cdca996eee6f2e794eec0e6a3801d8082,14,0.0003,0.02,0.0,0.002,1024,0.03,12,-1.0,0,5904,3095396352,2.845468,,0.1385,15299
+
+run_datetime_bj,git_commit,depth,lr,weight_decay,warmup_ratio,muon_lr,hidden_size,embedding_lr,target_param_data_ratio,grad_max_norm,params_total,num_iterations,tokens_trained,final_loss,val_bpb,core_score,train_time_sec
+2026-06-29 10:10:16,2735b760fd4a16e30524678aa231c748ebbb5ca9,28,0.003,0.02,0.0,0.01,1024,0.3,12,-1.0,0,10273,5386010624,2.617996,,0.2108,31639
+2026-06-29 18:57:36,2735b760fd4a16e30524678aa231c748ebbb5ca9,28,0.003,0.02,0.0,0.005,1024,0.3,12,-1.0,0,10273,5386010624,2.617493,,0.2015,31207
+2026-06-30 10:26:23,2735b760fd4a16e30524678aa231c748ebbb5ca9,28,0.003,0.02,0.0,0.015,1024,0.1,12,-1.0,0,10273,5386010624,2.621696,,0.2013,31378
+2026-06-30 19:09:22,2735b760fd4a16e30524678aa231c748ebbb5ca9,28,0.003,0.02,0.0,0.015,1024,0.3,12,-1.0,0,10273,5386010624,2.620569,,0.2092,31294
+2026-07-01 03:50:56,2735b760fd4a16e30524678aa231c748ebbb5ca9,28,0.003,0.02,0.0,0.01,1024,0.1,12,-1.0,0,10273,5386010624,2.621883,,0.1993,31249
+
 
 

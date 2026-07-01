@@ -25,6 +25,7 @@ from contextlib import nullcontext, contextmanager
 
 import wandb
 import torch
+import torch.nn.functional as F
 
 from nanochat.gpt import GPT, GPTConfig
 from nanochat.dataloader import tokenizing_distributed_data_loader_bos_bestfit, tokenizing_distributed_data_loader_with_state_bos_bestfit
@@ -67,13 +68,27 @@ parser.add_argument("--embedding-lr", type=float, default=0.3, help="learning ra
 parser.add_argument("--unembedding-lr", type=float, default=0.004, help="learning rate for unembedding (lm_head) parameters (Adam)")
 parser.add_argument("--weight-decay", type=float, default=0.2, help="cautious weight decay for the Muon optimizer (for weights)")
 parser.add_argument("--muon-lr", type=float, default=0.02, help="learning rate for matrix parameters (Muon)")
+parser.add_argument("--optimizer-mode", type=str, default="hybrid", choices=["hybrid", "adamw"], help="optimizer setup: hybrid(AdamW+Muon) or adamw")
+parser.add_argument("--ema-decay", type=float, default=0.0, help="EMA decay for model parameters (0 disables EMA, e.g. 0.999)")
+parser.add_argument("--ema-eval", action="store_true", help="evaluate/sample/save with EMA parameters when EMA is enabled")
+parser.add_argument("--mtp-num-heads", type=int, default=0, help="number of auxiliary MTP heads (0 disables MTP)")
+parser.add_argument("--mtp-weight", type=float, default=0.0, help="weight for MTP auxiliary loss")
+# DFLASH joint pretraining (block-diffusion draft trained online with the base model)
+parser.add_argument("--dflash-enable", action="store_true", help="train a DFLASH draft jointly during pretraining")
+parser.add_argument("--dflash-layers", type=int, default=1, help="number of DFLASH draft decoder layers")
+parser.add_argument("--dflash-block-size", type=int, default=16, help="DFLASH block size")
+parser.add_argument("--dflash-weight", type=float, default=0.3, help="weight for DFLASH draft loss")
+parser.add_argument("--dflash-mask-token-id", type=int, default=-1, help="DFLASH mask token id (-1 = last vocab id)")
+parser.add_argument("--dflash-grad-to-target", action="store_true", help="allow DFLASH loss to backprop into the base model (off = detached)")
+parser.add_argument("--dflash-num-blocks", type=int, default=8, help="number of randomly-anchored blocks per sequence")
+parser.add_argument("--dflash-gamma", type=float, default=4.0, help="exp-decay loss weighting gamma (w_k=exp(-(k)/gamma))")
 # parser.add_argument("--scalar-lr", type=float, default=0.5, help="learning rate for scalars (resid_lambdas, x0_lambdas)")
 parser.add_argument("--adam-beta1", type=float, default=0.9, help="Adam beta1 for embedding/unembedding")
 parser.add_argument("--adam-beta2", type=float, default=0.95, help="Adam beta2 for embedding/unembedding")
 parser.add_argument("--warmup-ratio", type=float, default=0.0, help="ratio of iterations for LR warmup")
 parser.add_argument("--warmdown-ratio", type=float, default=0.5, help="ratio of iterations for LR warmdown")
 parser.add_argument("--final-lr-frac", type=float, default=0.0, help="final LR as fraction of initial LR")
-parser.add_argument("--grad-max-norm", type=float, default=-1.0, help="clip-grad-nrom")
+parser.add_argument("--grad-max-norm", type=float, default=-1.0, help="clip-grad-norm")
 parser.add_argument("--lr-schedule", type=str, default="default", choices=["linear", "cosine", "default"], help="LR decay schedule during warmdown: linear or cosine")
 parser.add_argument("--resume-from-step", type=int, default=-1, help="resume training from this step (-1 = disable)")
 # Evaluation
@@ -140,6 +155,8 @@ def build_model_meta(depth):
     intermediate_size = hidden_size * 3
     config = Qwen3Config(head_dim=head_dim, hidden_act="silu", hidden_size=hidden_size,initializer_range=0.02,intermediate_size=intermediate_size,max_position_embeddings=args.max_seq_len*10,max_window_layers=layers,model_type="qwen3",
                 num_hidden_layers=layers,num_key_value_heads=num_attention_heads,rms_norm_eps=1e-6,tie_word_embeddings=False,vocab_size=vocab_size,use_cache=False, num_attention_heads=num_attention_heads)
+    config.mtp_num_heads = max(0, int(args.mtp_num_heads))
+    config.mtp_weight = max(0.0, float(args.mtp_weight))
     with torch.device("meta"):
         model_meta = Qwen3ForCausalLM(config)
     return model_meta
@@ -244,6 +261,41 @@ def disable_fp8(model):
         for parent, attr_name, fp8_module in fp8_locations:
             setattr(parent, attr_name, fp8_module)
 
+
+def init_ema_state(model):
+    return {
+        name: p.detach().clone()
+        for name, p in model.named_parameters()
+        if p.requires_grad
+    }
+
+
+@torch.no_grad()
+def update_ema_state(model, ema_state, decay):
+    one_minus_decay = 1.0 - decay
+    for name, p in model.named_parameters():
+        if name in ema_state:
+            ema_state[name].mul_(decay).add_(p.detach(), alpha=one_minus_decay)
+
+
+@contextmanager
+def apply_ema_weights(model, ema_state):
+    if not ema_state:
+        yield
+        return
+
+    backup = {}
+    try:
+        for name, p in model.named_parameters():
+            if name in ema_state:
+                backup[name] = p.detach().clone()
+                p.data.copy_(ema_state[name])
+        yield
+    finally:
+        for name, p in model.named_parameters():
+            if name in backup:
+                p.data.copy_(backup[name])
+
 # -----------------------------------------------------------------------------
 # Compile the model
 
@@ -260,6 +312,36 @@ if ddp:
     from torch.nn.parallel import DistributedDataParallel as DDP
     model = DDP(model, device_ids=[ddp_local_rank], broadcast_buffers=True)
     print0(f"Wrapped model in DistributedDataParallel (world_size={ddp_world_size})")
+
+# -----------------------------------------------------------------------------
+# DFLASH draft model (jointly trained during pretraining)
+draft_model = None
+draft_layer_ids = None
+dflash_mask_token_id = None
+if args.dflash_enable:
+    import sys as _sys
+    _sys.path.insert(0, os.path.join(os.path.dirname(__file__), "..", "dflash"))
+    from dflash.model import DFlashDraftModel, build_target_layer_ids, extract_context_feature
+    from transformers.models.qwen3.modeling_qwen3 import Qwen3Config as HFQwen3Config
+    num_heads = args.hidden_size // args.head_dim
+    draft_cfg = HFQwen3Config(
+        head_dim=args.head_dim, hidden_act="silu", hidden_size=args.hidden_size, initializer_range=0.02,
+        intermediate_size=args.hidden_size * 3, max_position_embeddings=args.max_seq_len * 10,
+        max_window_layers=args.dflash_layers, num_hidden_layers=args.dflash_layers,
+        num_key_value_heads=num_heads, rms_norm_eps=1e-6, tie_word_embeddings=False,
+        vocab_size=vocab_size, use_cache=False, num_attention_heads=num_heads,
+    )
+    draft_cfg.num_target_layers = args.depth
+    draft_cfg.block_size = args.dflash_block_size
+    dflash_mask_token_id = (vocab_size - 1) if args.dflash_mask_token_id < 0 else args.dflash_mask_token_id
+    draft_layer_ids = build_target_layer_ids(args.depth, args.dflash_layers)
+    draft_cfg.dflash_config = {"target_layer_ids": draft_layer_ids, "mask_token_id": dflash_mask_token_id}
+    draft_model = DFlashDraftModel(draft_cfg).to(device).to(torch.float32)
+    draft_model.train()
+    if ddp:
+        from torch.nn.parallel import DistributedDataParallel as DDP
+        draft_model = DDP(draft_model, device_ids=[ddp_local_rank], broadcast_buffers=True)
+    print0(f"DFLASH draft enabled: layers={args.dflash_layers} block={args.dflash_block_size} layer_ids={draft_layer_ids} mask_id={dflash_mask_token_id}")
 # -----------------------------------------------------------------------------
 # Scaling laws and muP extrapolations to determine the optimal training horizon, batch size, learning rates, weight decay.
 
@@ -375,9 +457,24 @@ muon_lr = args.muon_lr
 matrix_lr = muon_lr if muon_lr>0 else lr
 default_group = {"params":[], "lr":matrix_lr}
 lm_head_params=[]
+adamw_all_params = []
 
 
 for n,m in model.named_parameters():
+    is_no_decay = any(nd in n for nd in no_decay)
+    is_embed = "embed" in n
+    is_lm_head = "lm_head" in n
+
+    # AdamW-all mode groups (all params are optimized by AdamW)
+    if is_no_decay:
+        adamw_all_params.append({"params": [m], "lr": args.lr, "weight_decay": 0.0})
+    elif is_embed:
+        adamw_all_params.append({"params": [m], "lr": args.embedding_lr, "weight_decay": 0.0})
+    elif is_lm_head:
+        adamw_all_params.append({"params": [m], "lr": args.lr, "weight_decay": 0.0})
+    else:
+        adamw_all_params.append({"params": [m], "lr": args.lr, "weight_decay": weight_decay_scaled})
+
     if any(nd in n for nd in no_decay):
         no_weight_decay["params"].append(m)
     elif "lm_head" in n:
@@ -399,12 +496,27 @@ optimizer_grouped_parameters.extend(lm_head_params)
 # optimizer_grouped_parameters.extend(other_params.values())
 # optimizer_grouped_parameters.append(default_group)
 
-optimizer = torch.optim.AdamW(optimizer_grouped_parameters, lr=lr, weight_decay=weight_decay_scaled,
-                              betas=(args.adam_beta1, args.adam_beta2),eps=1e-10)  # betas are changed by wenhua
+if args.optimizer_mode == "adamw":
+    optimizer = torch.optim.AdamW(
+        adamw_all_params,
+        lr=lr,
+        weight_decay=weight_decay_scaled,
+        betas=(args.adam_beta1, args.adam_beta2),
+        eps=1e-10,
+    )
+else:
+    optimizer = torch.optim.AdamW(
+        optimizer_grouped_parameters,
+        lr=lr,
+        weight_decay=weight_decay_scaled,
+        betas=(args.adam_beta1, args.adam_beta2),
+        eps=1e-10,
+    )  # betas are changed by wenhua
+print0(f"Optimizer mode: {args.optimizer_mode}")
 
 # Only create muon_optimizer if muon_lr >= 0
 muon_optimizer = None
-if args.muon_lr >= 0:
+if args.optimizer_mode == "hybrid" and args.muon_lr >= 0:
     moun_parameters=[]
     moun_parameters.extend(other_params.values())
     moun_parameters.append(default_group)
@@ -415,6 +527,18 @@ if args.muon_lr >= 0:
 for group in optimizer.param_groups:
     group["initial_lr"] = group["lr"]
 
+ema_state = None
+if args.ema_decay > 0:
+    ema_state = init_ema_state(orig_model)
+    print0(f"EMA enabled (decay={args.ema_decay})")
+
+# Optimizer for the DFLASH draft (trained jointly, kept separate from base optimizers)
+draft_optimizer = None
+if draft_model is not None:
+    draft_optimizer = torch.optim.AdamW(draft_model.parameters(), lr=args.lr, weight_decay=0.0, betas=(0.9, 0.95))
+    for group in draft_optimizer.param_groups:
+        group["initial_lr"] = group["lr"]
+
 if resuming:
     # Backward compatible optimizer restore:
     # - old checkpoints: optimizer_data is AdamW state_dict
@@ -423,6 +547,10 @@ if resuming:
         optimizer.load_state_dict(optimizer_data["adamw"])
         if muon_optimizer is not None and optimizer_data.get("muon") is not None:
             muon_optimizer.load_state_dict(optimizer_data["muon"])
+        if ema_state is not None and optimizer_data.get("ema") is not None:
+            for name, ema_tensor in optimizer_data["ema"].items():
+                if name in ema_state:
+                    ema_state[name].copy_(ema_tensor.to(device=ema_state[name].device, dtype=ema_state[name].dtype))
     else:
         optimizer.load_state_dict(optimizer_data)
     del optimizer_data
@@ -553,8 +681,10 @@ while True:
     results = {}
     if args.core_metric_every > 0 and (last_step or (step > 0 and step % args.core_metric_every == 0)):
         model.eval()
-        with disable_fp8(orig_model), autocast_ctx:
-            results = evaluate_core(orig_model, tokenizer, device, max_per_task=args.core_metric_max_per_task)
+        ema_ctx = apply_ema_weights(orig_model, ema_state) if (args.ema_eval and ema_state is not None) else nullcontext()
+        with ema_ctx:
+            with disable_fp8(orig_model), autocast_ctx:
+                results = evaluate_core(orig_model, tokenizer, device, max_per_task=args.core_metric_max_per_task)
         print0(f"Step {step:05d} | CORE metric: {results['core_metric']:.4f}")
         wandb_run.log({
             "step": step,
@@ -578,11 +708,13 @@ while True:
             "If 5*x + 3 = 13, then x is",
         ]
         engine = Engine(orig_model, tokenizer) # use orig_model to avoid recompilation
-        for prompt in prompts:
-            tokens = tokenizer(prompt, prepend="<|bos|>")
-            with disable_fp8(orig_model), autocast_ctx:
-                sample, _ = engine.generate_batch(tokens, num_samples=1, max_tokens=16, temperature=0)
-            print0(tokenizer.decode(sample[0]))
+        ema_ctx = apply_ema_weights(orig_model, ema_state) if (args.ema_eval and ema_state is not None) else nullcontext()
+        with ema_ctx:
+            for prompt in prompts:
+                tokens = tokenizer(prompt, prepend="<|bos|>")
+                with disable_fp8(orig_model), autocast_ctx:
+                    sample, _ = engine.generate_batch(tokens, num_samples=1, max_tokens=16, temperature=0)
+                print0(tokenizer.decode(sample[0]))
         model.train()
 
     # save checkpoint: at the end of the run, or every save_every steps, except at the first step or the resume step
@@ -602,9 +734,21 @@ while True:
                 "total_training_time": total_training_time,
             },
         }
+        if args.ema_eval and ema_state is not None:
+            with apply_ema_weights(orig_model, ema_state):
+                model_state_for_save = {
+                    k: v.detach().clone()
+                    for k, v in orig_model.state_dict().items()
+                }
+        else:
+            model_state_for_save = orig_model.state_dict()
+
         optimizer_state = {
             "adamw": optimizer.state_dict(),
             "muon": muon_optimizer.state_dict() if muon_optimizer is not None else None,
+            "ema": ema_state,
+            "dflash_draft": (draft_model.module if ddp else draft_model).state_dict() if draft_model is not None else None,
+            "dflash_opt": draft_optimizer.state_dict() if draft_optimizer is not None else None,
         }
 
         if ddp:
@@ -614,7 +758,7 @@ while True:
                     save_checkpoint(
                         checkpoint_dir,
                         step,
-                        orig_model.state_dict(), # model parameters
+                        model_state_for_save, # model parameters
                         optimizer_state, # optimizer state(s), saved via torch.save
                         meta_dict,
                         rank=ddp_rank,
@@ -624,7 +768,7 @@ while True:
             save_checkpoint(
                 checkpoint_dir,
                 step,
-                orig_model.state_dict(), # model parameters
+                model_state_for_save, # model parameters
                 optimizer_state, # optimizer state(s), saved via torch.save
                 meta_dict,
                 rank=ddp_rank,
@@ -652,6 +796,42 @@ while True:
             train_loss = loss.detach() # for logging
             loss = loss / grad_accum_steps # each .backward() is a grad sum => normalize loss here
             loss.backward()
+        # DFLASH draft loss: predict masked blocks from detached target hidden states (online)
+        if draft_model is not None:
+            draft_sync = draft_model.no_sync() if (ddp and not is_last_micro) else nullcontext()
+            with draft_sync:
+                with autocast_ctx:
+                    B = args.dflash_block_size
+                    T = x.shape[1]
+                    bsz = x.shape[0]
+                    nb = args.dflash_num_blocks
+                    # need a clean anchor + (B-1) future tokens, so anchor in [0, T-B)
+                    if T - B > 0 and nb >= 1:
+                        if args.dflash_grad_to_target:
+                            all_hidden = orig_model.all_hidden_states_with_grad(x)
+                        else:
+                            all_hidden = orig_model.get_all_hidden_states(x)
+                        feat = extract_context_feature(all_hidden, draft_layer_ids)  # [bsz, T, H*L]
+                        # randomly sample nb anchor positions per sequence (block = anchor..anchor+B-1)
+                        anchors = torch.randint(0, T - B, (bsz, nb), device=device)  # [bsz, nb]
+                        rng = torch.arange(B, device=device)
+                        idx = anchors[:, :, None] + rng[None, None, :]  # [bsz, nb, B]
+                        bf = idx.reshape(bsz, nb * B)
+                        ctx = torch.gather(feat, 1, bf[:, :, None].expand(-1, -1, feat.shape[-1])).reshape(bsz * nb, B, feat.shape[-1])
+                        blk = torch.gather(x, 1, bf).reshape(bsz, nb, B).clone()
+                        blk[:, :, 1:] = dflash_mask_token_id  # keep clean anchor, mask the rest
+                        blk = blk.reshape(bsz * nb, B)
+                        emb = orig_model.model.embed_tokens(blk)
+                        noise_emb = emb if args.dflash_grad_to_target else emb.detach()
+                        pos = torch.arange(B, device=device).repeat(2).unsqueeze(0).expand(bsz * nb, 2 * B)
+                        h = draft_model(target_hidden=ctx, noise_embedding=noise_emb, position_ids=pos, use_cache=False, is_causal=False)
+                        lm_w = orig_model.lm_head.weight if args.dflash_grad_to_target else orig_model.lm_head.weight.detach()
+                        draft_logits = F.linear(h, lm_w).float()
+                        labels = torch.gather(y, 1, bf).reshape(bsz * nb, B)  # next-token targets per position
+                        per_tok = F.cross_entropy(draft_logits.reshape(-1, draft_logits.size(-1)), labels.reshape(-1), reduction="none").reshape(bsz * nb, B)
+                        wk = torch.exp(-rng.float() / max(1e-6, args.dflash_gamma))  # [B], emphasize early positions
+                        draft_loss = (per_tok * wk[None, :]).sum() / (per_tok.shape[0] * wk.sum())
+                        (args.dflash_weight * draft_loss / grad_accum_steps).backward()
         x, y, dataloader_state_dict = next(train_loader) # prefetch the next batch while the GPU is busy with forward/backward
     # step the optimizer
     lrm = get_lr_multiplier(step)
@@ -672,7 +852,16 @@ while True:
     optimizer.step()
     if muon_optimizer is not None:
         muon_optimizer.step()
+    if draft_optimizer is not None:
+        for group in draft_optimizer.param_groups:
+            group["lr"] = group["initial_lr"] * lrm
+        if args.grad_max_norm > 0:
+            torch.nn.utils.clip_grad_norm_(draft_model.parameters(), max_norm=args.grad_max_norm)
+        draft_optimizer.step()
+        draft_optimizer.zero_grad(set_to_none=True)
     model.zero_grad(set_to_none=True)
+    if ema_state is not None:
+        update_ema_state(orig_model, ema_state, args.ema_decay)
     train_loss_f = train_loss.item() # .item() is a CPU-GPU sync point
     synchronize()
     t1 = time.time()
