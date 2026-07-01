@@ -20,7 +20,21 @@ LLaDA/GUIDELINES.md. A reserved [MASK] token is appended at the end of the vocab
 """
 
 import os
+import sys
 os.environ.setdefault("PYTORCH_ALLOC_CONF", "expandable_segments:True")
+
+# When this script is run directly (not via -m), Python inserts the script's
+# directory (train_diffusion/) into sys.path[0].  That directory contains a
+# train_diffusion.py file which shadows the train_diffusion *package*, breaking
+# sub-module imports.  Fix: remove the script dir and force the project root to
+# the front so that `import train_diffusion.X` always resolves against the package.
+_project_root = os.path.dirname(os.path.dirname(os.path.abspath(__file__)))
+_script_dir = os.path.dirname(os.path.abspath(__file__))
+# Strip script dir (may appear multiple times).
+sys.path = [p for p in sys.path if os.path.abspath(p) != _script_dir]
+# Put project root first so the train_diffusion/ package wins.
+if _project_root not in sys.path:
+    sys.path.insert(0, _project_root)
 
 import gc
 import time
@@ -45,7 +59,7 @@ parser.add_argument("--head-dim", type=int, default=128)
 parser.add_argument("--max-seq-len", type=int, default=2048)
 parser.add_argument("--device-batch-size", type=int, default=16)
 parser.add_argument("--total-batch-size", type=int, default=-1, help="total tokens per step (-1 = device_batch*seq*world)")
-parser.add_argument("--num-iterations", type=int, default=5000)
+parser.add_argument("--num-iterations", type=int, default=6000)
 parser.add_argument("--lr", type=float, default=3e-3)
 parser.add_argument("--embedding-lr", type=float, default=0.3)
 parser.add_argument("--weight-decay", type=float, default=0.1)
@@ -124,11 +138,13 @@ num_iterations = args.num_iterations
 print0(f"total_batch_size={total_batch_size:,} grad_accum={grad_accum_steps} iters={num_iterations}")
 
 def lr_mult(it):
-    warm = round(args.warmup_ratio * num_iterations)
-    if it < warm:
-        return (it + 1) / max(1, warm)
-    prog = 1.0 - (it - warm) / max(1, num_iterations - warm)
-    return args.final_lr_frac + (1.0 - args.final_lr_frac) * prog
+    # Hold LR for the first half, then linearly decay to final-lr-frac.
+    half = num_iterations // 2
+    if it < half:
+        return 1.0
+    decay_total = max(1, num_iterations - half)
+    decay_prog = (it - half) / decay_total
+    return args.final_lr_frac + (1.0 - args.final_lr_frac) * (1.0 - decay_prog)
 
 # -----------------------------------------------------------------------------
 # -----------------------------------------------------------------------------
@@ -141,6 +157,7 @@ ckpt_path = os.path.join(ckpt_dir, "model.pt")
 
 model.train()
 smooth = 0.0
+train_start = time.time()
 for step in range(num_iterations + 1):
     last = step == num_iterations
     if args.sample_every > 0 and master_process and (last or (step > 0 and step % args.sample_every == 0)):
@@ -171,9 +188,18 @@ for step in range(num_iterations + 1):
     optimizer.zero_grad(set_to_none=True)
     lf = loss.item()
     smooth = 0.9 * smooth + 0.1 * lf
-    print0(f"step {step:05d}/{num_iterations} | loss {smooth/(1-0.9**(step+1)):.4f} | lrm {lrm:.2f} | dt {(time.time()-t0)*1000:.0f}ms")
+    elapsed = time.time() - train_start
+    done_steps = step + 1
+    remain_steps = max(0, num_iterations - done_steps)
+    avg_step_sec = elapsed / max(1, done_steps)
+    eta_sec = int(remain_steps * avg_step_sec)
+    eta_hms = time.strftime("%H:%M:%S", time.gmtime(eta_sec))
+    eta_at = time.strftime("%H:%M:%S", time.localtime(time.time() + eta_sec))
+    print0(
+        f"step {step:05d}/{num_iterations} | loss {smooth/(1-0.9**(step+1)):.4f} | "
+        f"lrm {lrm:.2f} | dt {(time.time()-t0)*1000:.0f}ms | eta {eta_hms} (at {eta_at})"
+    )
     if step % 2000 == 0:
         gc.collect()
 
 compute_cleanup()
-
