@@ -43,6 +43,10 @@ class DiffusionQwen3(nn.Module):
 
     def post_init(self):
         self.backbone.post_init()
+        # SDPA / FlashAttention use module.is_causal when attention_mask is None.
+        # Force bidirectional attention for all layers so no causal triangle is applied.
+        for layer in self.model.layers:
+            layer.self_attn.is_causal = False
 
     def re_init_weights(self):
         self.backbone.re_init_weights()

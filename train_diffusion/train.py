@@ -70,6 +70,12 @@ parser.add_argument("--mask-prob-eps", type=float, default=1e-3)
 parser.add_argument("--sample-every", type=int, default=1000)
 parser.add_argument("--save-every", type=int, default=-1)
 parser.add_argument("--model-tag", type=str, default=None)
+parser.add_argument("--final-eval-max-per-task", type=int, default=-1,
+                    help="examples per task for CORE eval after training (-1 = all data)")
+parser.add_argument("--final-eval-mc-num", type=int, default=32,
+                    help="Monte-Carlo masks per example for log-likelihood scoring")
+parser.add_argument("--skip-final-eval", action="store_true", default=False,
+                    help="skip CORE eval after training")
 args = parser.parse_args()
 
 # -----------------------------------------------------------------------------
@@ -201,5 +207,20 @@ for step in range(num_iterations + 1):
     )
     if step % 2000 == 0:
         gc.collect()
+
+# Post-training CORE eval
+if not args.skip_final_eval:
+    print0("=" * 60)
+    print0(f"Running CORE eval (max_per_task={args.final_eval_max_per_task}, mc_num={args.final_eval_mc_num}) ...")
+    from train_diffusion.eval_diffusion import evaluate_core_diffusion
+    raw_model.eval()
+    with (torch.amp.autocast(device_type=device_type, dtype=torch.bfloat16) if device_type == "cuda" else nullcontext()):
+        eval_res = evaluate_core_diffusion(
+            raw_model, tokenizer, device,
+            max_per_task=args.final_eval_max_per_task,
+            mc_num=args.final_eval_mc_num,
+        )
+    print0(f"CORE metric: {eval_res['core_metric']:.4f}")
+    print0("=" * 60)
 
 compute_cleanup()
