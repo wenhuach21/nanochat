@@ -49,6 +49,7 @@ from nanochat.dataloader import tokenizing_distributed_data_loader_with_state_bo
 from nanochat.qwen3 import Qwen3Config
 from train_diffusion.diffusion_model import DiffusionQwen3, save_diffusion
 from train_diffusion.sample_diffusion import generate
+from train_diffusion.eval_diffusion import evaluate_core_diffusion
 
 # -----------------------------------------------------------------------------
 parser = argparse.ArgumentParser(description="Train Qwen3 as a diffusion LLM")
@@ -70,12 +71,13 @@ parser.add_argument("--mask-prob-eps", type=float, default=1e-3)
 parser.add_argument("--sample-every", type=int, default=1000)
 parser.add_argument("--save-every", type=int, default=-1)
 parser.add_argument("--model-tag", type=str, default=None)
-parser.add_argument("--final-eval-max-per-task", type=int, default=-1,
-                    help="examples per task for CORE eval after training (-1 = all data)")
-parser.add_argument("--final-eval-mc-num", type=int, default=32,
-                    help="Monte-Carlo masks per example for log-likelihood scoring")
-parser.add_argument("--skip-final-eval", action="store_true", default=False,
-                    help="skip CORE eval after training")
+parser.add_argument("--core-eval-every", type=int, default=9999999,
+                    help="run CORE eval every N steps; last step always runs when > 0 (-1 = disabled). "
+                         "Default is a very large number so eval only runs on the last step.")
+parser.add_argument("--core-eval-max-per-task", type=int, default=-1,
+                    help="examples per task for periodic CORE eval (-1 = all data)")
+parser.add_argument("--core-eval-mc-num", type=int, default=1,
+                    help="Monte-Carlo masks per example for periodic CORE eval")
 args = parser.parse_args()
 
 # -----------------------------------------------------------------------------
@@ -166,18 +168,37 @@ smooth = 0.0
 train_start = time.time()
 for step in range(num_iterations + 1):
     last = step == num_iterations
+
+    # ---- sample ----
     if args.sample_every > 0 and master_process and (last or (step > 0 and step % args.sample_every == 0)):
         model.eval()
         prompt = torch.tensor([tokenizer("The capital of France is", prepend="<|bos|>")], device=device)
         out = generate(raw_model, prompt, gen_len=16, steps=16)
         print0("sample: " + tokenizer.decode(out[0].tolist()[: prompt.shape[1] + 16]))
         model.train()
+
+    # ---- checkpoint ----
     if master_process and (last or (args.save_every > 0 and step > 0 and step % args.save_every == 0)):
         save_diffusion(raw_model, ckpt_path)
         print0(f"saved checkpoint -> {ckpt_path}")
+
+    # ---- periodic CORE eval (all ranks participate; last step always runs when enabled) ----
+    if args.core_eval_every > 0 and (last or (step > 0 and step % args.core_eval_every == 0)):
+        model.eval()
+        print0(f"step {step:05d} | running CORE eval (max_per_task={args.core_eval_max_per_task}, mc_num={args.core_eval_mc_num}) ...")
+        with autocast_ctx:
+            eval_res = evaluate_core_diffusion(
+                raw_model, tokenizer, device,
+                max_per_task=args.core_eval_max_per_task,
+                mc_num=args.core_eval_mc_num,
+            )
+        print0(f"step {step:05d} | CORE metric: {eval_res['core_metric']:.4f}")
+        model.train()
+
     if last:
         break
 
+    # ---- training step ----
     t0 = time.time()
     for micro in range(grad_accum_steps):
         sync = model.no_sync() if (ddp and micro < grad_accum_steps - 1) else nullcontext()
@@ -205,22 +226,9 @@ for step in range(num_iterations + 1):
         f"step {step:05d}/{num_iterations} | loss {smooth/(1-0.9**(step+1)):.4f} | "
         f"lrm {lrm:.2f} | dt {(time.time()-t0)*1000:.0f}ms | eta {eta_hms} (at {eta_at})"
     )
+
     if step % 2000 == 0:
         gc.collect()
 
-# Post-training CORE eval
-if not args.skip_final_eval:
-    print0("=" * 60)
-    print0(f"Running CORE eval (max_per_task={args.final_eval_max_per_task}, mc_num={args.final_eval_mc_num}) ...")
-    from train_diffusion.eval_diffusion import evaluate_core_diffusion
-    raw_model.eval()
-    with (torch.amp.autocast(device_type=device_type, dtype=torch.bfloat16) if device_type == "cuda" else nullcontext()):
-        eval_res = evaluate_core_diffusion(
-            raw_model, tokenizer, device,
-            max_per_task=args.final_eval_max_per_task,
-            mc_num=args.final_eval_mc_num,
-        )
-    print0(f"CORE metric: {eval_res['core_metric']:.4f}")
-    print0("=" * 60)
 
 compute_cleanup()

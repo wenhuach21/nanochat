@@ -75,13 +75,18 @@ def evaluate_example(idx, model, tokenizer, data, device, task_meta, mc_num=128,
 
 
 def evaluate_task(model, tokenizer, data, device, task_meta, mc_num=128, gen_steps=0):
+    """Evaluate one task, distributing examples across ranks (mirrors nanochat core_eval)."""
     rank = dist.get_rank() if dist.is_initialized() else 0
     world = dist.get_world_size() if dist.is_initialized() else 1
+    # Pre-task sync: all ranks must start together so the post-task barrier is never stale.
+    if world > 1:
+        dist.barrier()
     correct = torch.zeros(len(data), device=device)
     for idx in range(rank, len(data), world):
         correct[idx] = float(evaluate_example(idx, model, tokenizer, data, device, task_meta, mc_num=mc_num, gen_steps=gen_steps))
     if world > 1:
-        dist.barrier(); dist.all_reduce(correct, op=dist.ReduceOp.SUM)
+        dist.barrier()
+        dist.all_reduce(correct, op=dist.ReduceOp.SUM)
     return correct.mean().item()
 
 
@@ -90,6 +95,10 @@ def evaluate_core_diffusion(model, tokenizer, device, max_per_task=-1, mc_num=12
     bundle = os.path.join(base_dir, "eval_bundle")
     if not os.path.exists(bundle):  # reuse base_eval's downloader
         download_file_with_lock(EVAL_BUNDLE_URL, "eval_bundle.zip", postprocess_fn=place_eval_bundle)
+    # Sync all ranks after bundle download so no rank races ahead while another is still
+    # fetching / extracting the bundle (avoids stale barrier mismatches on task 1).
+    if dist.is_initialized():
+        dist.barrier()
     tasks = yaml.safe_load(open(os.path.join(bundle, "core.yaml"), encoding="utf-8"))["icl_tasks"]
     baselines = {r["Eval Task"]: float(r["Random baseline"])
                  for r in csv.DictReader(open(os.path.join(bundle, "eval_meta_data.csv"), encoding="utf-8"))}
