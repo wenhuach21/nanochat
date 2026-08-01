@@ -9,18 +9,17 @@ from datetime import datetime, timedelta, timezone
 from itertools import product
 from pathlib import Path
 
-LABEL = "Qwen-0626"
+LABEL = "Qwen-0801-adamw"
 
 SWEEP_SPACE = {
-    "depth": [14],
-    "lr": [3e-3,3e-4],
+    "depth": [28],
+    "lr": [3e-3],
     "weight-decay": [0.02],
-    "warmup-ratio":[0.00],
-    "muon-lr": [0.02,0.002],
-    "hidden-size":[1024],
-    "embedding-lr":[0.3,0.03],
-    "target-param-data-ratio":[12],
-    "grad-max-norm":[-1.0,1.0]
+    "warmup-ratio": [0.00],
+    "hidden-size": [1024],
+    "embedding-lr": [0.3],
+    "target-param-data-ratio": [100],
+    "grad-max-norm": [-1.0],
 }
 
 TOKENS_PER_ITER = 524288
@@ -44,6 +43,7 @@ results_dir.mkdir(parents=True, exist_ok=True)
 
 results_file = results_dir / "results.csv"
 SWEEP_PARAM_COLUMNS = [k.replace("-", "_") for k in SWEEP_SPACE.keys()]
+BOOL_FLAG_KEYS = {"ema-eval"}
 
 
 # -------------------------
@@ -112,9 +112,17 @@ def extract_named_int(name, text):
 
 
 def value_for_tag(v):
+    if isinstance(v, bool):
+        return "1" if v else "0"
     if isinstance(v, float):
         return f"{v:g}".replace(".", "p")
     return str(v)
+
+
+def build_cli_arg(k, v):
+    if k in BOOL_FLAG_KEYS:
+        return f"--{k}" if bool(v) else None
+    return f"--{k}={v}"
 
 
 def tail_lines(text, n=40):
@@ -234,6 +242,16 @@ def main():
         d = int(sweep_values["depth"])
         run_datetime_bj = beijing_time_str()
 
+        # Reduce duplicate combinations:
+        # - AdamW mode ignores muon-lr, keep only the first value
+        # - EMA eval is meaningful only when ema-decay > 0
+        if sweep_values.get("optimizer-mode") == "adamw":
+            muon_candidates = SWEEP_SPACE.get("muon-lr", [])
+            if muon_candidates and sweep_values.get("muon-lr") != muon_candidates[0]:
+                continue
+        if float(sweep_values.get("ema-decay", 0.0)) <= 0.0 and bool(sweep_values.get("ema-eval", False)):
+            continue
+
         if run_exists(sweep_values):
             log(f"Skipping {sweep_values} (already exists)")
             continue
@@ -251,7 +269,7 @@ def main():
             f"--nproc_per_node={NPROC_PER_NODE}",
             "-m", "scripts.base_train_qwen3",
             "--",
-            *(f"--{k}={v}" for k, v in sweep_values.items()),
+            *(arg for k, v in sweep_values.items() for arg in [build_cli_arg(k, v)] if arg is not None),
             f"--run={WANDB_RUN}_{tag}",
             f"--model-tag={tag}",
             "--core-metric-every=999999",
