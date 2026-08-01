@@ -9,7 +9,7 @@ from datetime import datetime, timedelta, timezone
 from itertools import product
 from pathlib import Path
 
-LABEL = "Qwen-0801-adamw"
+LABEL = "Qwen-0801-1000"
 
 SWEEP_SPACE = {
     "depth": [28],
@@ -272,10 +272,11 @@ def main():
             *(arg for k, v in sweep_values.items() for arg in [build_cli_arg(k, v)] if arg is not None),
             f"--run={WANDB_RUN}_{tag}",
             f"--model-tag={tag}",
-            "--core-metric-every=999999",
+            "--core-metric-every=10000",
             "--core-metric-max-per-task=-1",
-            "--sample-every=-1",
-            "--save-every=-1",
+            ""
+            "--sample-every=10000",
+            "--save-every=10000",
         ]
 
         log_file = results_dir / f"{tag}_train.log"
