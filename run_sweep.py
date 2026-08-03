@@ -9,7 +9,7 @@ from datetime import datetime, timedelta, timezone
 from itertools import product
 from pathlib import Path
 
-LABEL = "Qwen-0801-1000"
+LABEL = "Qwen-0803-100"
 
 SWEEP_SPACE = {
     "depth": [28],
@@ -274,7 +274,6 @@ def main():
             f"--model-tag={tag}",
             "--core-metric-every=10000",
             "--core-metric-max-per-task=-1",
-            ""
             "--sample-every=10000",
             "--save-every=10000",
         ]

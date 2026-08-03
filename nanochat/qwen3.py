@@ -449,12 +449,57 @@ class Qwen3ForCausalLM(Qwen3PreTrainedModel, GenerationMixin):
         self.model = Qwen3Model(config)
         self.vocab_size = config.vocab_size
         self.lm_head = nn.Linear(config.hidden_size, config.vocab_size, bias=False)
+        # Optional MTP heads for predicting farther-future tokens from the same hidden state.
+        self.mtp_num_heads = int(getattr(config, "mtp_num_heads", 0) or 0)
+        self.mtp_weight = float(getattr(config, "mtp_weight", 0.0) or 0.0)
+        self.mtp_heads = nn.ModuleList(
+            [nn.Linear(config.hidden_size, config.vocab_size, bias=False) for _ in range(self.mtp_num_heads)]
+        )
 
         # Initialize weights and apply final processing
         self.post_init()
 
     def get_device(self):
         return self.device
+
+    @torch.no_grad()
+    def get_all_hidden_states(self, idx):
+        """Return list of hidden states [embed_out, layer1_out, ..., layerN_out (pre-final-norm)].
+        Used as the frozen target for DFLASH draft training (context features)."""
+        return self._all_hidden_states(idx)
+
+    def all_hidden_states_with_grad(self, idx):
+        """Same as get_all_hidden_states but keeps the autograd graph (DFLASH grads flow to target)."""
+        return self._all_hidden_states(idx)
+
+    def _all_hidden_states(self, idx):
+        m = self.model
+        inputs_embeds = m.embed_tokens(idx)
+        position_ids = torch.arange(inputs_embeds.shape[1], device=inputs_embeds.device).unsqueeze(0)
+        mask_kwargs = {
+            "config": m.config,
+            "inputs_embeds": inputs_embeds,
+            "attention_mask": None,
+            "past_key_values": None,
+            "position_ids": position_ids,
+        }
+        causal_mask_mapping = {"full_attention": create_causal_mask(**mask_kwargs)}
+        if m.has_sliding_layers:
+            causal_mask_mapping["sliding_attention"] = create_sliding_window_causal_mask(**mask_kwargs)
+        hidden_states = inputs_embeds
+        position_embeddings = m.rotary_emb(hidden_states, position_ids)
+        all_hidden = [hidden_states]
+        for i, decoder_layer in enumerate(m.layers[: m.config.num_hidden_layers]):
+            hidden_states = decoder_layer(
+                hidden_states,
+                attention_mask=causal_mask_mapping[m.config.layer_types[i]],
+                position_embeddings=position_embeddings,
+                position_ids=position_ids,
+                past_key_values=None,
+                use_cache=False,
+            )
+            all_hidden.append(hidden_states)
+        return all_hidden
 
     # def forward(self, idx, targets=None, kv_cache=None, loss_reduction='mean'):
     #     logits = self.forward1(idx,labels=targets)
@@ -471,8 +516,32 @@ class Qwen3ForCausalLM(Qwen3PreTrainedModel, GenerationMixin):
     #         # inference: just return the logits directly
     #         return logits
 
+    def _compute_mtp_loss(self, hidden_states, targets, loss_reduction='mean'):
+        if self.mtp_num_heads <= 0 or self.mtp_weight <= 0 or targets is None:
+            return None
+        import torch.nn.functional as F
+        mtp_losses = []
+        for i, head in enumerate(self.mtp_heads):
+            # Head i predicts token at horizon (i + 2): t+2, t+3, ...
+            horizon = i + 2
+            valid_t = hidden_states.size(1) - (horizon - 1)
+            if valid_t <= 0:
+                continue
+            logits_h = head(hidden_states[:, :valid_t, :])
+            targets_h = targets[:, horizon - 1 : horizon - 1 + valid_t]
+            loss_h = F.cross_entropy(
+                logits_h.reshape(-1, logits_h.size(-1)),
+                targets_h.reshape(-1),
+                ignore_index=-1,
+                reduction=loss_reduction,
+            )
+            mtp_losses.append(loss_h)
+        if not mtp_losses:
+            return None
+        return sum(mtp_losses) / len(mtp_losses)
+
     def forward(self, idx, targets=None, kv_cache=None, loss_reduction='mean'):
-        logits = self.forward1(idx,labels=targets)
+        logits, hidden_states = self.forward1(idx, labels=targets, return_hidden_states=True)
         logits = logits.float()  # switch to fp32 for logit softcap and loss computation
         softcap = 15  # smoothly cap the logits to the range [-softcap, softcap]
         logits = softcap * torch.tanh(logits / softcap)  # squash the logits
@@ -484,6 +553,9 @@ class Qwen3ForCausalLM(Qwen3PreTrainedModel, GenerationMixin):
             import torch.nn.functional as F
             loss = F.cross_entropy(logits.view(-1, logits.size(-1)), targets.view(-1), ignore_index=-1,
                                    reduction=loss_reduction)
+            mtp_loss = self._compute_mtp_loss(hidden_states, targets, loss_reduction=loss_reduction)
+            if mtp_loss is not None:
+                loss = loss + self.mtp_weight * mtp_loss
             return loss
         else:
             # inference: just return the logits directly
@@ -544,6 +616,7 @@ class Qwen3ForCausalLM(Qwen3PreTrainedModel, GenerationMixin):
         labels: torch.LongTensor | None = None,
         use_cache: bool | None = None,
         logits_to_keep: int | torch.Tensor = 0,
+        return_hidden_states: bool = False,
         **kwargs: Unpack[TransformersKwargs],
     ) -> CausalLMOutputWithPast:
         r"""
@@ -551,6 +624,10 @@ class Qwen3ForCausalLM(Qwen3PreTrainedModel, GenerationMixin):
             Labels for computing the masked language modeling loss. Indices should either be in `[0, ...,
             config.vocab_size]` or -100 (see `input_ids` docstring). Tokens with indices set to `-100` are ignored
             (masked), the loss is only computed for the tokens with labels in `[0, ..., config.vocab_size]`.
+        return_hidden_states (`bool`, *optional*, defaults to `False`):
+            Whether to return the final hidden states in addition to the logits and loss. When `True` the return
+            value is a tuple ``(CausalLMOutputWithPast, hidden_states)`` instead of just
+            ``CausalLMOutputWithPast``.
 
         Example:
 
@@ -582,6 +659,8 @@ class Qwen3ForCausalLM(Qwen3PreTrainedModel, GenerationMixin):
         # Only compute necessary logits, and do not upcast them to float if we are not computing the loss
         slice_indices = slice(-logits_to_keep, None) if isinstance(logits_to_keep, int) else logits_to_keep
         logits = self.lm_head(hidden_states[:, slice_indices, :])
+        if return_hidden_states:
+            return logits, hidden_states
         return logits
 
 

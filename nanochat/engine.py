@@ -193,7 +193,13 @@ class Engine:
 
         # 1) Run a batch 1 prefill of the prompt tokens
         m = self.model.config
-        kv_model_kwargs = {"num_heads": m.n_kv_head, "head_dim": m.n_embd // m.n_head, "num_layers": m.n_layer}
+        # Support both GPT-style config (n_kv_head, n_embd, n_head, n_layer)
+        # and HuggingFace-style config (num_key_value_heads, hidden_size, num_attention_heads, num_hidden_layers)
+        n_kv_head = getattr(m, "n_kv_head", None) or getattr(m, "num_key_value_heads")
+        n_embd = getattr(m, "n_embd", None) or getattr(m, "hidden_size")
+        n_head = getattr(m, "n_head", None) or getattr(m, "num_attention_heads")
+        n_layer = getattr(m, "n_layer", None) or getattr(m, "num_hidden_layers")
+        kv_model_kwargs = {"num_heads": n_kv_head, "head_dim": n_embd // n_head, "num_layers": n_layer}
         kv_cache_prefill = KVCache(
             batch_size=1,
             seq_len=len(tokens),
