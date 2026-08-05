@@ -145,7 +145,7 @@ token_bytes = get_token_bytes(device=device)
 vocab_size = tokenizer.get_vocab_size()
 print0(f"Vocab size: {vocab_size:,}")
 # -----------------------------------------------------------------------------
-def build_model_meta(depth):
+def build_model_meta(depth, hidden_size_override=None, num_kv_heads_override=None):
     # from transformers import AutoConfig,AutoModelForCausalLM
     # config = AutoConfig.from_pretrained
     from nanochat.qwen3 import Qwen3Config,Qwen3ForCausalLM
@@ -153,10 +153,10 @@ def build_model_meta(depth):
     # tie_word_embeddings=Ture
     ## layers= 28
     layers = depth
-    hidden_size = args.hidden_size
+    hidden_size = hidden_size_override if hidden_size_override is not None else args.hidden_size
     head_dim = args.head_dim
     num_attention_heads = hidden_size//head_dim
-    num_kv_heads = args.num_kv_heads if args.num_kv_heads > 0 else num_attention_heads
+    num_kv_heads = num_kv_heads_override if num_kv_heads_override is not None else (args.num_kv_heads if args.num_kv_heads > 0 else num_attention_heads)
     intermediate_size = hidden_size * 3
     config = Qwen3Config(head_dim=head_dim, hidden_act="silu", hidden_size=hidden_size,initializer_range=0.02,intermediate_size=intermediate_size,max_position_embeddings=args.max_seq_len*10,max_window_layers=layers,model_type="qwen3",
                 num_hidden_layers=layers,num_key_value_heads=num_kv_heads,rms_norm_eps=1e-6,tie_word_embeddings=False,vocab_size=vocab_size,use_cache=False, num_attention_heads=num_attention_heads)
@@ -472,7 +472,7 @@ print0(f"Parameters: {num_params/1e9:.3f}B")
 
 target_tokens = int(args.target_param_data_ratio * num_params) # optimal tokens for the model we are about to train
 B_REF = 256*2048  # reference batch size in tokens (for d28, hidden_size=1024)
-d_ref_model = build_model_meta(28)  # reference model: d28, hidden_size=1024
+d_ref_model = build_model_meta(28, hidden_size_override=1024)  # reference model: d28, hidden_size=1024
 d_ref_params = sum(p.numel() for p in d_ref_model.parameters())
 D_REF = num_params / d_ref_params  # ratio of current model size to reference model size
 del d_ref_model
