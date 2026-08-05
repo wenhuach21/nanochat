@@ -274,8 +274,9 @@ def main():
             f"--model-tag={tag}",
             "--core-metric-every=10000",
             "--core-metric-max-per-task=-1",
-            "--sample-every=10000",
-            "--save-every=10000",
+            "--sample-every=1000",
+            "--save-every=5000",
+            "--resume-from-step=20000"
         ]
 
         log_file = results_dir / f"{tag}_train.log"
