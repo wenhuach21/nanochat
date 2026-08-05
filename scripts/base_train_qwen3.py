@@ -53,6 +53,7 @@ parser.add_argument("--depth", type=int, default=14, help="depth of the Transfor
 # parser.add_argument("--aspect-ratio", type=int, default=64, help="model_dim = depth * aspect_ratio")
 parser.add_argument("--hidden-size", type=int, default=1024, help="hidden size")
 parser.add_argument("--head-dim", type=int, default=128, help="target head dimension for attention")
+parser.add_argument("--num-kv-heads", type=int, default=-1, help="number of key/value heads for GQA (-1 = same as num_attention_heads, i.e. MHA)")
 parser.add_argument("--max-seq-len", type=int, default=2048, help="max context length")
 parser.add_argument("--window-pattern", type=str, default="SSSL", help="sliding window pattern tiled across layers: L=full, S=half context (e.g. 'SSL')")
 # Training horizon (only one used, in order of precedence)
@@ -155,9 +156,10 @@ def build_model_meta(depth):
     hidden_size = args.hidden_size
     head_dim = args.head_dim
     num_attention_heads = hidden_size//head_dim
+    num_kv_heads = args.num_kv_heads if args.num_kv_heads > 0 else num_attention_heads
     intermediate_size = hidden_size * 3
     config = Qwen3Config(head_dim=head_dim, hidden_act="silu", hidden_size=hidden_size,initializer_range=0.02,intermediate_size=intermediate_size,max_position_embeddings=args.max_seq_len*10,max_window_layers=layers,model_type="qwen3",
-                num_hidden_layers=layers,num_key_value_heads=num_attention_heads,rms_norm_eps=1e-6,tie_word_embeddings=False,vocab_size=vocab_size,use_cache=False, num_attention_heads=num_attention_heads)
+                num_hidden_layers=layers,num_key_value_heads=num_kv_heads,rms_norm_eps=1e-6,tie_word_embeddings=False,vocab_size=vocab_size,use_cache=False, num_attention_heads=num_attention_heads)
     config.mtp_num_heads = max(0, int(args.mtp_num_heads))
     config.mtp_weight = max(0.0, float(args.mtp_weight))
     with torch.device("meta"):
@@ -428,11 +430,12 @@ if args.dflash_enable:
     from dflash.model import DFlashDraftModel, build_target_layer_ids, extract_context_feature
     from transformers.models.qwen3.modeling_qwen3 import Qwen3Config as HFQwen3Config
     num_heads = args.hidden_size // args.head_dim
+    num_kv_heads_draft = args.num_kv_heads if args.num_kv_heads > 0 else num_heads
     draft_cfg = HFQwen3Config(
         head_dim=args.head_dim, hidden_act="silu", hidden_size=args.hidden_size, initializer_range=0.02,
         intermediate_size=args.hidden_size * 3, max_position_embeddings=args.max_seq_len * 10,
         max_window_layers=args.dflash_layers, num_hidden_layers=args.dflash_layers,
-        num_key_value_heads=num_heads, rms_norm_eps=1e-6, tie_word_embeddings=False,
+        num_key_value_heads=num_kv_heads_draft, rms_norm_eps=1e-6, tie_word_embeddings=False,
         vocab_size=vocab_size, use_cache=False, num_attention_heads=num_heads,
     )
     draft_cfg.num_target_layers = args.depth
