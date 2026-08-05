@@ -100,6 +100,9 @@ parser.add_argument("--sample-every", type=int, default=2000, help="sample from 
 parser.add_argument("--save-every", type=int, default=-1, help="save checkpoints every N steps (-1 = only at end)")
 # Output
 parser.add_argument("--model-tag", type=str, default=None, help="override model tag for checkpoint directory name")
+# Depth expansion (model growth)
+parser.add_argument("--expand-from", type=str, default=None, help="path to a smaller checkpoint to expand from (auto depth-expand if it has fewer layers than --depth)")
+parser.add_argument("--expand-from-step", type=int, default=-1, help="step of the checkpoint to expand from (-1 = latest)")
 args = parser.parse_args()
 user_config = vars(args).copy()  # for logging
 # -----------------------------------------------------------------------------
@@ -171,6 +174,107 @@ print0(model_config)
 model.to_empty(device=device) # 2) All tensors get storage on target device but with uninitialized (garbage) data
 model.post_init() # 3) All tensors get initialized
 model.re_init_weights()
+
+# ---- Depth Expansion (Model Growth) ----
+# If --expand-from is set, load a smaller checkpoint and expand its layers to match --depth.
+# Strategy: function-preserving expansion by zeroing output projections (o_proj, down_proj) of new layers.
+if args.expand_from is not None:
+    from scripts.grow_depth import expand_layers_depth
+    import copy
+
+    expand_dir = args.expand_from
+    # Load the source checkpoint
+    if args.expand_from_step == -1:
+        # Find the latest step in the expand-from directory
+        import glob as _glob
+        model_files = _glob.glob(os.path.join(expand_dir, "model_step*.pt"))
+        if not model_files:
+            raise FileNotFoundError(f"No model checkpoints found in {expand_dir}")
+        steps = [int(f.split("model_step")[1].split(".pt")[0]) for f in model_files]
+        expand_step = max(steps)
+    else:
+        expand_step = args.expand_from_step
+
+    expand_model_path = os.path.join(expand_dir, f"model_step{expand_step:05d}.pt")
+    if not os.path.exists(expand_model_path):
+        expand_model_path = os.path.join(expand_dir, f"model_step{expand_step}.pt")
+    print0(f"[Depth Expansion] Loading source checkpoint: {expand_model_path}")
+    expand_state = torch.load(expand_model_path, map_location=device, weights_only=False)
+
+    # Detect source layer count from state_dict keys
+    src_layer_keys = [k for k in expand_state.keys() if "model.layers." in k]
+    src_layer_indices = set()
+    for k in src_layer_keys:
+        parts = k.split("model.layers.")
+        if len(parts) > 1:
+            idx = int(parts[1].split(".")[0])
+            src_layer_indices.add(idx)
+    src_n_layers = max(src_layer_indices) + 1 if src_layer_indices else 0
+    tgt_n_layers = args.depth
+
+    if src_n_layers == 0:
+        raise ValueError(f"[Depth Expansion] Could not detect layer count from source checkpoint")
+
+    if src_n_layers == tgt_n_layers:
+        # Same depth - just load directly
+        print0(f"[Depth Expansion] Source has same depth ({src_n_layers}), loading weights directly.")
+        model.load_state_dict(expand_state, strict=False, assign=True)
+    elif src_n_layers < tgt_n_layers:
+        print0(f"[Depth Expansion] Expanding depth: {src_n_layers} -> {tgt_n_layers} layers ({tgt_n_layers/src_n_layers:.2f}x)")
+
+        # Build a temporary source model with the source depth to load weights cleanly
+        src_model = build_model_meta(src_n_layers)
+        src_model.to_empty(device=device)
+        src_model.post_init()
+        src_model.load_state_dict(expand_state, strict=False, assign=True)
+
+        # Expand the layer ModuleList with function-preserving init (zero o_proj and down_proj)
+        zero_proj_names = ["o_proj.weight", "down_proj.weight"]
+        expanded_layers = expand_layers_depth(src_model.model.layers, tgt_n_layers, zero_proj_names)
+
+        # Copy non-layer params from source (embeddings, norm, lm_head)
+        model.model.embed_tokens.load_state_dict(src_model.model.embed_tokens.state_dict())
+        model.model.norm.load_state_dict(src_model.model.norm.state_dict())
+        model.lm_head.load_state_dict(src_model.lm_head.state_dict())
+        # Copy MTP heads if they exist
+        if hasattr(src_model, 'mtp_heads') and len(src_model.mtp_heads) > 0:
+            for i, head in enumerate(src_model.mtp_heads):
+                if i < len(model.mtp_heads):
+                    model.mtp_heads[i].load_state_dict(head.state_dict())
+
+        # Replace the layers in the target model
+        model.model.layers = expanded_layers
+
+        # Fix layer_idx in attention modules (important for KV cache correctness)
+        for idx, layer in enumerate(model.model.layers):
+            if hasattr(layer, 'self_attn'):
+                layer.self_attn.layer_idx = idx
+
+        # Update layer_types in config if needed
+        if hasattr(model.config, 'layer_types'):
+            src_types = src_model.config.layer_types if hasattr(src_model.config, 'layer_types') else ["full_attention"] * src_n_layers
+            new_types = [src_types[i % len(src_types)] for i in range(tgt_n_layers)]
+            model.config.layer_types = new_types
+            model.config.num_hidden_layers = tgt_n_layers
+
+        del src_model, expand_state
+        if device_type == "cuda":
+            torch.cuda.empty_cache()
+
+        # Verify: quick forward pass to check no NaN
+        print0(f"[Depth Expansion] Verifying expanded model...")
+        model.eval()
+        test_ids = torch.randint(0, vocab_size, (1, 32), device=device)
+        with torch.no_grad(), autocast_ctx:
+            test_logits = model(test_ids)
+            if hasattr(test_logits, 'logits'):
+                test_logits = test_logits.logits
+        assert not torch.isnan(test_logits).any(), "NaN detected in expanded model output!"
+        print0(f"[Depth Expansion] ✅ Expansion successful! Model output is valid.")
+        model.train()
+    else:
+        raise ValueError(f"[Depth Expansion] Source has MORE layers ({src_n_layers}) than target ({tgt_n_layers}). Cannot shrink.")
+
 # If we are resuming, overwrite the model parameters with those of the checkpoint
 base_dir = get_base_dir()
 output_dirname = args.model_tag if args.model_tag else f"d{args.depth}" # e.g. d12
@@ -364,13 +468,14 @@ num_params = sum(p.numel() for p in model.parameters())
 print0(f"Parameters: {num_params/1e9:.3f}B")
 
 target_tokens = int(args.target_param_data_ratio * num_params) # optimal tokens for the model we are about to train
-B_REF = 256*2048
-d14_model = build_model_meta(14)
-d14_params = sum(p.numel() for p in d14_model.parameters())
-D_REF = num_params/ d14_params # TODO this is different from origin
+B_REF = 256*2048  # reference batch size in tokens (for d28, hidden_size=1024)
+d_ref_model = build_model_meta(28)  # reference model: d28, hidden_size=1024
+d_ref_params = sum(p.numel() for p in d_ref_model.parameters())
+D_REF = num_params / d_ref_params  # ratio of current model size to reference model size
+del d_ref_model
 total_batch_size = args.total_batch_size # user-provided override is possible
 if total_batch_size == -1:
-    batch_size_ratio =  D_REF
+    batch_size_ratio = D_REF
     predicted_batch_size = B_REF * batch_size_ratio ** 0.383
     total_batch_size = 2 ** round(math.log2(predicted_batch_size)) # clamp to nearest power of 2 for efficiency
     print0(f"Auto-computed optimal batch size: {total_batch_size:,} tokens")
@@ -390,48 +495,29 @@ if total_batch_size == -1:
 #     print0(f"Auto-computed optimal batch size: {total_batch_size:,} tokens")
 
 # 3) Knowing the batch size, we can now calculate a learning rate correction (bigger batch size allows higher learning rates)
-batch_lr_scale = 1.0
-# batch_ratio = total_batch_size / B_REF # B/B_ref
-# if batch_ratio != 1.0:
-#     # SGD: linear scaling with batch size is standard (not used in nanochat)
-#     # AdamW: sqrt scaling is standard: η ∝ √(B/B_ref)
-#     # Muon: we will use the same scaling for Muon as for AdamW: η ∝ √(B/B_ref) (not studied carefully, assumption!)
-#     batch_lr_scale = batch_ratio ** 0.5 # η ∝ √(B/B_ref)
-#     print0(f"Scaling LRs by {batch_lr_scale:.4f} for batch size {total_batch_size:,} (reference: {B_REF:,})")
+batch_ratio = total_batch_size / B_REF  # B/B_ref
+if batch_ratio != 1.0:
+    # AdamW/Muon: sqrt scaling is standard: η ∝ √(B/B_ref)
+    batch_lr_scale = batch_ratio ** 0.5
+    print0(f"Scaling LRs by {batch_lr_scale:.4f} for batch size {total_batch_size:,} (reference: {B_REF:,})")
+else:
+    batch_lr_scale = 1.0
 
-# 4) Knowing the batch size and the token horizon, we can now calculate the appropriate weight decay scaling
-# We adopt the T_epoch framework from https://arxiv.org/abs/2405.13698
-# Central idea of the paper is that T_epoch = B/(η·λ·D) should remain constant.
-# Above, we used learning rate scaling η ∝ √(B/B_ref). So it's a matter of ~10 lines of math to derive that to keep T_epoch constant, we need:
-# λ = λ_ref · √(B/B_ref) · (D_ref/D)
-# Note that these papers study AdamW, *not* Muon. We are blindly following AdamW theory for scaling hoping it ~works for Muon too.
-
-# num_scaling_params = get_scaling_params(model)
-# target_tokens = int(args.target_param_data_ratio * num_scaling_params) # optimal tokens for the model we are about to train
-#
-# weight_decay_scaled = args.weight_decay * math.sqrt(total_batch_size / B_REF) * (1.0/D_REF)
-# if weight_decay_scaled != args.weight_decay:
-#     print0(f"Scaling weight decay from {args.weight_decay:.6f} to {weight_decay_scaled:.6f} for depth {args.depth}")
-#
-# # -----------------------------------------------------------------------------
-# # Initialize the Optimizer (combined MuonAdamW: Muon for matrix params, AdamW for rest)
-# optimizer = model.setup_optimizer(
-#     # AdamW hyperparameters
-#     unembedding_lr=args.unembedding_lr * batch_lr_scale,
-#     embedding_lr=args.embedding_lr * batch_lr_scale,
-#     scalar_lr=args.scalar_lr * batch_lr_scale,
-#     adam_betas=(args.adam_beta1, args.adam_beta2),
-#     # Muon hyperparameters
-#     matrix_lr=args.matrix_lr * batch_lr_scale,
-#     weight_decay=weight_decay_scaled,
-# )
+# 4) Weight decay scaling: λ = λ_ref · √(B/B_ref) · (D_ref/D)
+# Adopt T_epoch framework from https://arxiv.org/abs/2405.13698
+# Keep T_epoch = B/(η·λ·D) constant across model sizes.
+weight_decay_scaled = args.weight_decay * math.sqrt(total_batch_size / B_REF) * (1.0 / max(D_REF, 1.0))
+if weight_decay_scaled != args.weight_decay:
+    print0(f"Scaling weight decay from {args.weight_decay:.6f} to {weight_decay_scaled:.6f} for depth {args.depth}")
+else:
+    weight_decay_scaled = args.weight_decay
 
 batch_size = 256
 # total_batch_size = args.max_seq_len*batch_size
 # num_iterations = 10000 # TODO
 lr = args.lr * batch_lr_scale
 weight_decay = args.weight_decay
-weight_decay_scaled = args.weight_decay* 1.0
+# weight_decay_scaled already computed above via T_epoch scaling
 # Optimizer
 # Split weights in two groups, one with weight decay and the other not.
 no_decay = ["bias", "norm.weight"]  # norm.weight change by wenhua
