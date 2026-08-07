@@ -482,6 +482,20 @@ if total_batch_size == -1:
     predicted_batch_size = B_REF * batch_size_ratio ** 0.383
     total_batch_size = 2 ** round(math.log2(predicted_batch_size)) # clamp to nearest power of 2 for efficiency
     print0(f"Auto-computed optimal batch size: {total_batch_size:,} tokens")
+
+# When resuming, ALWAYS keep total_batch_size identical to the run that produced the checkpoint.
+# total_batch_size = tokens per optimizer step; num_iterations = target_tokens // total_batch_size,
+# and the LR warmup/warmdown schedule is derived from num_iterations. If total_batch_size differs
+# (e.g. resuming with a different GPU count / batch settings), num_iterations and the schedule would
+# no longer align with the saved `step`, silently corrupting the resume. So we force it to match.
+if resuming and meta_data is not None and meta_data.get("total_batch_size") is not None:
+    ckpt_total_batch_size = int(meta_data["total_batch_size"])
+    if total_batch_size != ckpt_total_batch_size:
+        print0(
+            f"[Resume] Overriding total_batch_size {total_batch_size:,} -> {ckpt_total_batch_size:,} "
+            f"(from checkpoint) to keep num_iterations / LR schedule consistent with the saved step."
+        )
+    total_batch_size = ckpt_total_batch_size
 # Our reference model is d12, this is where a lot of hyperparameters are tuned and then transfered to higher depths (muP style)
 # d12_ref = build_model_meta(12) # creates the model on meta device
 # D_REF = args.target_param_data_ratio * get_scaling_params(d12_ref) # compute-optimal d12 training horizon in tokens (measured empirically)
@@ -768,7 +782,9 @@ while True:
     # use the original uncompiled model because the inputs keep changing shape
     # disable FP8 for evaluation to use BF16 for more consistent/accurate results
     results = {}
-    if args.core_metric_every > 0 and (last_step or (step > 0 and step % args.core_metric_every == 0)):
+    # Note: skip the resume step itself (step == resume_from_step) so we don't immediately eval right
+    # after resuming (e.g. resume from 5000 shouldn't trigger CORE eval at step 5000).
+    if args.core_metric_every > 0 and (last_step or (step > 0 and step != args.resume_from_step and step % args.core_metric_every == 0)):
         model.eval()
         ema_ctx = apply_ema_weights(orig_model, ema_state) if (args.ema_eval and ema_state is not None) else nullcontext()
         with ema_ctx:
@@ -785,7 +801,8 @@ while True:
 
     # once in a while: sample from the model (only on master process)
     # use the original uncompiled model because the inputs keep changing shape
-    if args.sample_every > 0 and master_process and (last_step or (step > 0 and step % args.sample_every == 0)):
+    # (also skip the resume step itself, same as CORE eval above)
+    if args.sample_every > 0 and master_process and (last_step or (step > 0 and step != args.resume_from_step and step % args.sample_every == 0)):
         model.eval()
         prompts = [
             "The capital of France is",

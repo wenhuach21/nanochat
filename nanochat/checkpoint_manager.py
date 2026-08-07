@@ -79,7 +79,11 @@ def save_checkpoint(checkpoint_dir, step, model_data, optimizer_data, meta_data,
         with open(meta_path, "w", encoding="utf-8") as f:
             json.dump(meta_data, f, indent=2)
         logger.info(f"Saved metadata to: {meta_path}")
-    # Note that optimizer state is sharded across ranks, so each rank must save its own.
+    # Under plain DDP the optimizer state is *replicated* (not sharded): gradients are
+    # all-reduced so every rank derives identical optimizer state. We still save one file
+    # per rank for convenience/robustness, but any shard is interchangeable -- which is why
+    # load_checkpoint can safely fall back to another rank's shard when resuming with a
+    # different world size (e.g. 2 GPUs -> 4 GPUs).
     if optimizer_data is not None:
         os.makedirs(checkpoint_dir, exist_ok=True)
         optimizer_path = os.path.join(checkpoint_dir, f"optim_{step:06d}_rank{rank:d}.pt")
