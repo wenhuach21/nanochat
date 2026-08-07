@@ -94,6 +94,27 @@ def load_checkpoint(checkpoint_dir, step, device, load_optimizer=False, rank=0):
     optimizer_data = None
     if load_optimizer:
         optimizer_path = os.path.join(checkpoint_dir, f"optim_{step:06d}_rank{rank:d}.pt")
+        if not os.path.exists(optimizer_path):
+            # The checkpoint may have been saved with fewer ranks than we are resuming with
+            # (e.g. saved with 2 GPUs, resuming with 4). The optimizer state is only weakly
+            # coupled to the specific rank, so fall back to an available shard. We map this
+            # rank onto the available shards round-robin to spread them out a bit.
+            available = sorted(
+                int(re.search(r"_rank(\d+)\.pt$", f).group(1))
+                for f in glob.glob(os.path.join(checkpoint_dir, f"optim_{step:06d}_rank*.pt"))
+            )
+            if not available:
+                raise FileNotFoundError(
+                    f"No optimizer checkpoints found for step {step} in {checkpoint_dir}"
+                )
+            fallback_rank = available[rank % len(available)]
+            fallback_path = os.path.join(checkpoint_dir, f"optim_{step:06d}_rank{fallback_rank:d}.pt")
+            log0(
+                f"Optimizer shard for rank{rank} not found ({optimizer_path}); "
+                f"falling back to rank{fallback_rank} ({fallback_path}). "
+                f"Available shards: {available}"
+            )
+            optimizer_path = fallback_path
         optimizer_data = torch.load(optimizer_path, map_location=device)
     # Load the metadata
     meta_path = os.path.join(checkpoint_dir, f"meta_{step:06d}.json")
@@ -215,8 +236,21 @@ def load_optimizer_state(source, device, rank, model_tag=None, step=None):
         step = find_last_step(checkpoint_dir)
     optimizer_path = os.path.join(checkpoint_dir, f"optim_{step:06d}_rank{rank:d}.pt")
     if not os.path.exists(optimizer_path):
-        log0(f"Optimizer checkpoint not found: {optimizer_path}")
-        return None
+        # Resuming with more ranks than were saved: fall back to an available shard.
+        available = sorted(
+            int(re.search(r"_rank(\d+)\.pt$", f).group(1))
+            for f in glob.glob(os.path.join(checkpoint_dir, f"optim_{step:06d}_rank*.pt"))
+        )
+        if not available:
+            log0(f"Optimizer checkpoint not found: {optimizer_path}")
+            return None
+        fallback_rank = available[rank % len(available)]
+        fallback_path = os.path.join(checkpoint_dir, f"optim_{step:06d}_rank{fallback_rank:d}.pt")
+        log0(
+            f"Optimizer shard for rank{rank} not found; falling back to rank{fallback_rank}. "
+            f"Available shards: {available}"
+        )
+        optimizer_path = fallback_path
     log0(f"Loading optimizer state from {optimizer_path}")
     optimizer_data = torch.load(optimizer_path, map_location=device)
     return optimizer_data
