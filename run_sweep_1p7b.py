@@ -278,6 +278,7 @@ def main():
             "--core-metric-max-per-task=-1",
             "--sample-every=1000",
             "--save-every=5000",
+            "--end-step=-1"  # -1 means no end step (train to full horizon)
         ]
 
         log_file = results_dir / f"{tag}_train.log"

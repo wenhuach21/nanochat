@@ -69,6 +69,7 @@ parser.add_argument("--warmup-ratio", type=float, default=0.0, help="ratio of it
 parser.add_argument("--warmdown-ratio", type=float, default=0.5, help="ratio of iterations for LR warmdown")
 parser.add_argument("--final-lr-frac", type=float, default=0.0, help="final LR as fraction of initial LR")
 parser.add_argument("--resume-from-step", type=int, default=-1, help="resume training from this step (-1 = disable)")
+parser.add_argument("--end-step", type=int, default=-1, help="stop THIS training session at this step (-1 = disable). Note: this does NOT change the model's full training horizon / LR schedule (still based on num_iterations); it only pauses the current run early so it can be resumed later via --resume-from-step.")
 # Evaluation
 parser.add_argument("--eval-every", type=int, default=250, help="evaluate val bpb every N steps (-1 = disable)")
 parser.add_argument("--eval-tokens", type=int, default=40*524288, help="number of tokens to evaluate val loss on")
@@ -343,6 +344,17 @@ else:
     raise ValueError("No training horizon specified")
 total_tokens = total_batch_size * num_iterations # the actual number of tokens we will train for
 print0(f"Total number of training tokens: {total_tokens:,}")
+
+# --end-step only controls where THIS session stops; the LR schedule / horizon still uses num_iterations.
+end_step = args.end_step
+if end_step is not None and end_step > 0:
+    if end_step >= num_iterations:
+        print0(f"[end-step] Requested end_step={end_step} >= num_iterations={num_iterations}; ignoring (will train to the full horizon).")
+        end_step = -1
+    elif resuming and meta_data is not None and end_step <= int(meta_data["step"]):
+        raise ValueError(f"[end-step] end_step={end_step} must be greater than the resume step ({int(meta_data['step'])}).")
+    else:
+        print0(f"[end-step] This session will stop at step {end_step} (full horizon is {num_iterations}). Resume later with --resume-from-step={end_step}.")
 print0(f"Tokens : Scaling params ratio: {total_batch_size * num_iterations / num_scaling_params:.2f}") # e.g. Chinchilla was ~20
 print0(f"Total training FLOPs estimate: {num_flops_per_token * total_tokens:e}")
 
@@ -398,6 +410,10 @@ print0(f"Total batch size {total_batch_size:,} => gradient accumulation steps: {
 # Go!
 while True:
     last_step = step == num_iterations # loop runs num_iterations+1 times so that we can eval/save at the end
+    # If --end-step is set, stop THIS session early at end_step (eval/save at that step, then break).
+    # The LR schedule is unaffected (still based on num_iterations), so this is a pause, not the final horizon.
+    if end_step > 0 and step == end_step:
+        last_step = True
     flops_so_far = num_flops_per_token * total_batch_size * step
 
     # once in a while: evaluate the val bpb (all ranks participate)
