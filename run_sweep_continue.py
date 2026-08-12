@@ -9,18 +9,16 @@ from datetime import datetime, timedelta, timezone
 from itertools import product
 from pathlib import Path
 
-LABEL = "Qwen1p7-0803-100"
+LABEL = "Qwen-0812-continue"
 
 SWEEP_SPACE = {
     "depth": [28],
-    "lr": [3e-3],
-    "weight-decay": [0.02],
+    "lr": [1e-3],
+    "weight-decay": [0.01],
     "warmup-ratio": [0.00],
-    "hidden-size": [2048],
-    "head-dim":[128],
-    "num-kv-heads":[8],
-    "embedding-lr": [0.3],
-    "target-param-data-ratio": [100],
+    "hidden-size": [1024],
+    "embedding-lr": [0.01],
+    "target-param-data-ratio": [20],
     "grad-max-norm": [-1.0],
 }
 
@@ -317,7 +315,10 @@ def main():
             "--core-metric-max-per-task=-1",
             "--sample-every=1000",
             "--save-every=5000",
-            "--end-step=-1"  # -1 means no end step (train to full horizon)
+            "--end-step=-1",  # -1 means no end step (train to full horizon)
+            "--data-dir=/dataset/wenhuach/nanochat/base_data:/dataset/wenhuach/fineweb/sample/100BT",
+            "--init-from=/dataset/wenhuach/nanochat/base_checkpoints/sweep_Qwen-0803-100_depth28_lr0p003_weightdecay0p02_warmupratio0_hiddensize1024_embeddinglr0p3_targetparamdataratio100_gradmaxnorm-1"
+
         ]
 
         log_file = results_dir / f"{tag}_train.log"

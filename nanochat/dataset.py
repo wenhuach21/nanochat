@@ -31,23 +31,81 @@ os.makedirs(DATA_DIR, exist_ok=True)
 # These functions are useful utilities to other modules, can/should be imported
 
 def list_parquet_files(data_dir=None):
-    """ Looks into a data dir and returns full paths to all parquet files. """
+    """
+    Looks into a data dir (or multiple dirs) and returns full paths to all parquet files.
+    Supports colon-separated multiple directories for mixing datasets, e.g.:
+        data_dir = "/path/to/base_data:/path/to/fineweb_data"
+    """
     data_dir = DATA_DIR if data_dir is None else data_dir
-    parquet_files = sorted([
-        f for f in os.listdir(data_dir)
-        if f.endswith('.parquet') and not f.endswith('.tmp')
-    ])
-    parquet_paths = [os.path.join(data_dir, f) for f in parquet_files]
+
+    # Support multiple directories separated by colon (or semicolon on Windows)
+    separator = ";" if os.name == "nt" else ":"
+    if separator in str(data_dir):
+        dirs = [d.strip() for d in data_dir.split(separator) if d.strip()]
+    else:
+        dirs = [data_dir]
+
+    parquet_paths = []
+    for d in dirs:
+        d = os.path.expanduser(d)
+        if not os.path.isdir(d):
+            print(f"Warning: data directory '{d}' does not exist, skipping.")
+            continue
+        files = sorted([
+            f for f in os.listdir(d)
+            if f.endswith('.parquet') and not f.endswith('.tmp')
+        ])
+        parquet_paths.extend([os.path.join(d, f) for f in files])
+
     return parquet_paths
 
-def parquets_iter_batched(split, start=0, step=1):
+
+def print_dataset_summary(data_dir=None, split="train"):
+    """
+    Print a summary of the dataset: number of files, total rows, and source directories.
+    Useful for verifying that mixed datasets (e.g. fineweb + edu) are loaded correctly.
+    """
+    parquet_paths = list_parquet_files(data_dir)
+    all_paths = parquet_paths[:-1] if split == "train" else parquet_paths[-1:]
+
+    total_rows = 0
+    total_row_groups = 0
+    dir_stats = {}  # directory -> (num_files, num_rows)
+
+    for filepath in all_paths:
+        pf = pq.ParquetFile(filepath)
+        num_rows = pf.metadata.num_rows
+        total_rows += num_rows
+        total_row_groups += pf.num_row_groups
+
+        parent_dir = os.path.dirname(filepath)
+        if parent_dir not in dir_stats:
+            dir_stats[parent_dir] = [0, 0]
+        dir_stats[parent_dir][0] += 1
+        dir_stats[parent_dir][1] += num_rows
+
+    print(f"  Dataset summary ({split}):")
+    print(f"    Total files: {len(all_paths)}, Total samples: {total_rows:,}, Row groups: {total_row_groups:,}")
+    if len(dir_stats) > 1:
+        print(f"    Sources ({len(dir_stats)} directories):")
+        for d, (nf, nr) in sorted(dir_stats.items()):
+            pct = nr / total_rows * 100 if total_rows > 0 else 0
+            print(f"      {os.path.basename(d)}: {nf} files, {nr:,} samples ({pct:.1f}%)")
+    else:
+        for d in dir_stats:
+            print(f"    Source: {os.path.basename(d)}")
+    print()
+    return total_rows
+
+def parquets_iter_batched(split, start=0, step=1, data_dir=None):
     """
     Iterate through the dataset, in batches of underlying row_groups for efficiency.
     - split can be "train" or "val". the last parquet file will be val.
     - start/step are useful for skipping rows in DDP. e.g. start=rank, step=world_size
+    - data_dir: optional data directory (supports colon-separated multiple dirs)
     """
     assert split in ["train", "val"], "split must be 'train' or 'val'"
-    parquet_paths = list_parquet_files()
+    parquet_paths = list_parquet_files(data_dir)
     parquet_paths = parquet_paths[:-1] if split == "train" else parquet_paths[-1:]
     for filepath in parquet_paths:
         pf = pq.ParquetFile(filepath)

@@ -76,3 +76,5 @@ adam
 2026-07-01 23:51:46,59631107d2fda1c1c0c04e0fa900c13df81a1f56,14,0.0004,0.02,0.0,adamw,1024,0.3,12,-1.0,0,5904,3095396352,2.996275,,0.1195,29933
 2026-07-02 10:10:10,59631107d2fda1c1c0c04e0fa900c13df81a1f56,14,0.003,0.02,0.0,adamw,1024,0.3,12,-1.0,0,5904,3095396352,2.923395,,0.1335,15148
 
+run_datetime_bj,git_commit,depth,lr,weight_decay,warmup_ratio,hidden_size,embedding_lr,target_param_data_ratio,grad_max_norm,params_total,num_iterations,tokens_trained,final_loss,val_bpb,core_score,train_time_sec
+2026-08-04 14:23:46,unknown,28,0.003,0.02,0.0,1024,0.3,100,-1.0,0,85612,44885344256,2.443012,,0.261,638582

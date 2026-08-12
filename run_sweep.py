@@ -82,6 +82,45 @@ def run_exists(sweep_values):
     return False
 
 
+def build_tag(sweep_values):
+    tag_suffix = "_".join(
+        f"{k.replace('-', '')}{value_for_tag(v)}"
+        for k, v in sweep_values.items()
+    )
+    return f"sweep_{LABEL}_{tag_suffix}"
+
+
+def extract_last_step_progress(text):
+    """Parse the last 'step X/Y' training log line -> (last_step, total_iterations).
+
+    Returns (None, None) if no training step line is present.
+    """
+    matches = re.findall(r"step\s+(\d+)/(\d+)", text)
+    if not matches:
+        return None, None
+    last_step, total = matches[-1]
+    return int(last_step), int(total)
+
+
+def run_completed(sweep_values):
+    """A run counts as done ONLY if training fully reached the final step (num_iterations).
+
+    A result row (or checkpoint) may exist even when a run was intentionally paused early
+    via --end-step; in that case we want to continue it, not skip it. So instead of just
+    checking whether a CSV row exists, we inspect the per-run training log and require that
+    the last logged step reached the total number of iterations.
+    """
+    log_file = results_dir / f"{build_tag(sweep_values)}_train.log"
+    if not log_file.exists():
+        return False
+    text = log_file.read_text(errors="ignore")
+    last_step, total = extract_last_step_progress(text)
+    if last_step is None or not total:
+        return False
+    # training logs step in [0, total-1]; reaching total-1 means the final step was trained
+    return last_step + 1 >= total
+
+
 def grep_last(pattern, text):
     import re
     matches = re.findall(pattern, text)
@@ -252,8 +291,8 @@ def main():
         if float(sweep_values.get("ema-decay", 0.0)) <= 0.0 and bool(sweep_values.get("ema-eval", False)):
             continue
 
-        if run_exists(sweep_values):
-            log(f"Skipping {sweep_values} (already exists)")
+        if run_completed(sweep_values):
+            log(f"Skipping {sweep_values} (already fully trained to final step)")
             continue
 
         tag_suffix = "_".join(

@@ -45,6 +45,10 @@ parser = argparse.ArgumentParser(description="Pretrain base model")
 parser.add_argument("--run", type=str, default="dummy", help="wandb run name ('dummy' disables wandb logging)")
 # Runtime
 parser.add_argument("--device-type", type=str, default="", help="cuda|cpu|mps (empty = autodetect)")
+# Data
+parser.add_argument("--data-dir", type=str, default="", help="data directory path. Use colon-separated (semicolon on Windows) paths to mix datasets. Empty = default fineweb-edu-100b-shuffle.")
+parser.add_argument("--shuffle-files", action="store_true", default=True, help="shuffle parquet file order each epoch (recommended when mixing multiple data sources)")
+parser.add_argument("--no-shuffle-files", action="store_false", dest="shuffle_files", help="disable file shuffling (read files in sorted order)")
 # FP8 training
 parser.add_argument("--fp8", action="store_true", help="enable FP8 training (requires H100+ GPU and torchao)")
 parser.add_argument("--fp8-recipe", type=str, default="tensorwise", choices=["rowwise", "tensorwise"], help="FP8 scaling recipe: tensorwise (faster, recommended) or rowwise (more accurate but slower)")
@@ -92,6 +96,8 @@ parser.add_argument("--final-lr-frac", type=float, default=0.0, help="final LR a
 parser.add_argument("--grad-max-norm", type=float, default=-1.0, help="clip-grad-norm")
 parser.add_argument("--lr-schedule", type=str, default="default", choices=["linear", "cosine", "default"], help="LR decay schedule during warmdown: linear or cosine")
 parser.add_argument("--resume-from-step", type=int, default=-1, help="resume training from this step (-1 = disable)")
+parser.add_argument("--init-from", type=str, default="", help="checkpoint directory to initialize model weights from (no optimizer/schedule restore, just weights)")
+parser.add_argument("--init-step", type=int, default=-1, help="step of the checkpoint to load for --init-from (-1 = latest)")
 parser.add_argument("--end-step", type=int, default=-1, help="stop THIS training session at this step (-1 = disable). Note: this does NOT change the model's full training horizon / LR schedule (still based on num_iterations); it only pauses the current run early so it can be resumed later via --resume-from-step.")
 # Evaluation
 parser.add_argument("--eval-every", type=int, default=250, help="evaluate val bpb every N steps (-1 = disable)")
@@ -290,6 +296,28 @@ if resuming:#  TODO this have bugs
     model_data, optimizer_data, meta_data = load_checkpoint(checkpoint_dir, args.resume_from_step, device, load_optimizer=True, rank=ddp_rank)
     model.load_state_dict(model_data, strict=True, assign=True)
     del model_data # free up this memory after the copy
+elif args.init_from:
+    # Initialize model weights from a checkpoint directory (no optimizer/schedule restore)
+    init_dir = os.path.expanduser(args.init_from)
+    if args.init_step == -1:
+        # Find latest step in the init directory
+        import re as _re, glob as _glob
+        model_files = _glob.glob(os.path.join(init_dir, "model_*.pt"))
+        if not model_files:
+            raise FileNotFoundError(f"No model checkpoints found in {init_dir}")
+        steps = [int(_re.search(r"model_(\d+)\.pt", f).group(1)) for f in model_files]
+        init_step = max(steps)
+    else:
+        init_step = args.init_step
+    print0(f"Initializing model weights from {init_dir} step {init_step} (no optimizer/schedule restore)")
+    init_model_data, _, _ = load_checkpoint(init_dir, init_step, device, load_optimizer=False)
+    # Load with strict=False to allow architecture differences (e.g. different head count)
+    missing, unexpected = model.load_state_dict(init_model_data, strict=False, assign=True)
+    if missing:
+        print0(f"  Warning: {len(missing)} missing keys (will be randomly initialized): {missing[:5]}...")
+    if unexpected:
+        print0(f"  Warning: {len(unexpected)} unexpected keys (ignored): {unexpected[:5]}...")
+    del init_model_data
 
 # -----------------------------------------------------------------------------
 # FP8 training initialization and management (this has to be done before torch.compile)
@@ -662,8 +690,17 @@ if resuming:
 # -----------------------------------------------------------------------------
 # Initialize the DataLoaders for train/val
 dataloader_resume_state_dict = None if not resuming else meta_data["dataloader_state_dict"]
-train_loader = tokenizing_distributed_data_loader_with_state_bos_bestfit(tokenizer, args.device_batch_size, args.max_seq_len, split="train", device=device, resume_state_dict=dataloader_resume_state_dict)
-build_val_loader = lambda: tokenizing_distributed_data_loader_bos_bestfit(tokenizer, args.device_batch_size, args.max_seq_len, split="val", device=device)
+data_dir = args.data_dir if args.data_dir else None
+
+# Print dataset summary so user can verify data sources
+from nanochat.dataset import print_dataset_summary
+print0("=" * 60)
+if master_process:
+    print_dataset_summary(data_dir, split="train")
+print0("=" * 60)
+
+train_loader = tokenizing_distributed_data_loader_with_state_bos_bestfit(tokenizer, args.device_batch_size, args.max_seq_len, split="train", device=device, resume_state_dict=dataloader_resume_state_dict, data_dir=data_dir, shuffle_files=args.shuffle_files)
+build_val_loader = lambda: tokenizing_distributed_data_loader_bos_bestfit(tokenizer, args.device_batch_size, args.max_seq_len, split="val", device=device, data_dir=data_dir)
 x, y, dataloader_state_dict = next(train_loader) # kick off load of the very first batch of data
 
 # -----------------------------------------------------------------------------

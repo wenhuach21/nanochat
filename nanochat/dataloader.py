@@ -16,24 +16,29 @@ Fallback to the original if you have very limited data AND long documents:
 https://github.com/karpathy/nanochat/blob/3c3a3d7/nanochat/dataloader.py#L78-L117
 """
 
+import random
 import torch
 import pyarrow.parquet as pq
 
 from nanochat.common import get_dist_info
 from nanochat.dataset import list_parquet_files
 
-def _document_batches(split, resume_state_dict, tokenizer_batch_size):
+def _document_batches(split, resume_state_dict, tokenizer_batch_size, data_dir=None, shuffle_files=False):
     """
     Infinite iterator over document batches (list of text strings) from parquet files.
 
     Handles DDP sharding and approximate resume. Each yield is (text_batch, (pq_idx, rg_idx, epoch))
     where text_batch is a list of document strings, indices track position for resumption,
     and epoch counts how many times we've cycled through the dataset (starts at 1).
+
+    If shuffle_files=True, parquet files are shuffled each epoch (useful when mixing multiple
+    data sources to ensure interleaving). The shuffle is deterministic per epoch and consistent
+    across DDP ranks.
     """
     ddp, ddp_rank, ddp_local_rank, ddp_world_size = get_dist_info()
 
-    parquet_paths = list_parquet_files()
-    assert len(parquet_paths) != 0, "No dataset parquet files found, did you run dataset.py?"
+    parquet_paths = list_parquet_files(data_dir)
+    assert len(parquet_paths) != 0, "No dataset parquet files found, did you run dataset.py or nanochat.fineweb?"
     parquet_paths = parquet_paths[:-1] if split == "train" else parquet_paths[-1:]
 
     resume_pq_idx = resume_state_dict["pq_idx"] if resume_state_dict is not None else 0
@@ -43,18 +48,28 @@ def _document_batches(split, resume_state_dict, tokenizer_batch_size):
     pq_idx = resume_pq_idx
     epoch = resume_epoch
 
+    def _get_file_order(epoch):
+        """Get file order for a given epoch. Deterministic shuffle if enabled."""
+        if not shuffle_files:
+            return list(range(len(parquet_paths)))
+        rng = random.Random(42 + epoch)
+        order = list(range(len(parquet_paths)))
+        rng.shuffle(order)
+        return order
+
     while True:  # iterate infinitely (multi-epoch)
-        pq_idx = resume_pq_idx if first_pass else 0
-        while pq_idx < len(parquet_paths):
+        file_order = _get_file_order(epoch)
+        start_idx = resume_pq_idx if first_pass else 0
+        for order_pos in range(start_idx, len(file_order)):
+            pq_idx = file_order[order_pos] if shuffle_files else order_pos
             filepath = parquet_paths[pq_idx]
             pf = pq.ParquetFile(filepath)
             # Start from resume point if resuming on same file, otherwise from DDP rank
-            if first_pass and (resume_rg_idx is not None) and (pq_idx == resume_pq_idx):
+            if first_pass and (resume_rg_idx is not None) and (order_pos == start_idx):
                 base_idx = resume_rg_idx // ddp_world_size
                 base_idx += 1  # advance by 1 so we don't repeat data after resuming
                 rg_idx = base_idx * ddp_world_size + ddp_rank
                 if rg_idx >= pf.num_row_groups:
-                    pq_idx += 1
                     continue
                 resume_rg_idx = None  # only do this once
             else:
@@ -65,7 +80,6 @@ def _document_batches(split, resume_state_dict, tokenizer_batch_size):
                 for i in range(0, len(batch), tokenizer_batch_size):
                     yield batch[i:i+tokenizer_batch_size], (pq_idx, rg_idx, epoch)
                 rg_idx += ddp_world_size
-            pq_idx += 1
         first_pass = False
         epoch += 1
 
@@ -74,7 +88,7 @@ def tokenizing_distributed_data_loader_with_state_bos_bestfit(
     tokenizer, B, T, split,
     tokenizer_threads=4, tokenizer_batch_size=128,
     device="cuda", resume_state_dict=None,
-    buffer_size=1000
+    buffer_size=1000, data_dir=None, shuffle_files=False
 ):
     """
     BOS-aligned dataloader with Best-Fit Cropping.
@@ -91,11 +105,18 @@ def tokenizing_distributed_data_loader_with_state_bos_bestfit(
     - Every row starts with BOS
     - 100% utilization (no padding, every token is trained on)
     - Approximately 35% of all tokens are discarded due to cropping
+
+    Args:
+        data_dir: Path to data directory. Supports colon-separated (or semicolon on Windows)
+                  multiple directories for mixing datasets, e.g.:
+                  "/path/to/base_data:/path/to/fineweb_data"
+        shuffle_files: If True, shuffle parquet file order each epoch (recommended when
+                       mixing multiple data sources for better interleaving).
     """
     assert split in ["train", "val"], "split must be 'train' or 'val'"
 
     row_capacity = T + 1
-    batches = _document_batches(split, resume_state_dict, tokenizer_batch_size)
+    batches = _document_batches(split, resume_state_dict, tokenizer_batch_size, data_dir=data_dir, shuffle_files=shuffle_files)
     bos_token = tokenizer.get_bos_token_id()
     doc_buffer = []
     pq_idx, rg_idx, epoch = 0, 0, 1
