@@ -1,14 +1,19 @@
 """
-Train model. From root directory of the project, run as:
+Train the Qwen3.5 (text-only) LLM, nanochat-style. Run from the repo root:
 
-python -m scripts.base_train
+python -m nanochat.qwen35.base_train_qwen3p5
 
-or distributed as:
+or distributed:
 
-torchrun --nproc_per_node=8 -m scripts.base_train
+torchrun --nproc_per_node=8 -m nanochat.qwen35.base_train_qwen3p5
 
-If you are only on CPU/Macbook, you'll want to train a much much smaller LLM. Example:
-python -m scripts.base_train --depth=4 --max-seq-len=512 --device-batch-size=1 --eval-tokens=512 --core-metric-every=-1 --total-batch-size=512 --num-iterations=20
+Tiny CPU/laptop smoke run:
+python -m nanochat.qwen35.base_train_qwen3p5 --depth=4 --hidden-size=128 --head-dim=32 \
+    --max-seq-len=512 --device-batch-size=1 --core-metric-every=-1 \
+    --total-batch-size=512 --num-iterations=20
+
+This mirrors scripts/base_train_qwen3.py but builds a Qwen3_5ForCausalLM (hybrid
+GatedDeltaNet + gated full-attention) and defaults to the transformers tokenizer.
 """
 
 import os
@@ -16,18 +21,15 @@ import os
 
 os.environ["PYTORCH_ALLOC_CONF"] = "expandable_segments:True"
 import gc
-import json
 import time
 import math
 import argparse
-from dataclasses import asdict
 from contextlib import nullcontext, contextmanager
 
 import wandb
 import torch
 import torch.nn.functional as F
 
-from nanochat.gpt import GPT, GPTConfig
 from nanochat.dataloader import tokenizing_distributed_data_loader_bos_bestfit, tokenizing_distributed_data_loader_with_state_bos_bestfit
 from nanochat.common import compute_init, compute_cleanup, print0, DummyWandb, print_banner, get_base_dir, autodetect_device_type, get_peak_flops
 from nanochat.tokenizer import get_tokenizer, get_token_bytes
@@ -40,7 +42,7 @@ print_banner()
 
 # -----------------------------------------------------------------------------
 # CLI arguments
-parser = argparse.ArgumentParser(description="Pretrain base model")
+parser = argparse.ArgumentParser(description="Pretrain Qwen3.5 text-only base model")
 # Logging
 parser.add_argument("--run", type=str, default="dummy", help="wandb run name ('dummy' disables wandb logging)")
 # Runtime
@@ -49,30 +51,38 @@ parser.add_argument("--device-type", type=str, default="", help="cuda|cpu|mps (e
 parser.add_argument("--data-dir", type=str, default="", help="data directory path. Use colon-separated (semicolon on Windows) paths to mix datasets. Empty = default fineweb-edu-100b-shuffle.")
 parser.add_argument("--shuffle-files", action="store_true", default=True, help="shuffle parquet file order each epoch (recommended when mixing multiple data sources)")
 parser.add_argument("--no-shuffle-files", action="store_false", dest="shuffle_files", help="disable file shuffling (read files in sorted order)")
-parser.add_argument("--tokenizer-backend", type=str, default="rustbpe", choices=["rustbpe", "transformers"], help="which tokenizer to train/evaluate with: rustbpe (RustBPE+tiktoken) or transformers (PreTrainedTokenizerFast)")
-# FP8 training
-parser.add_argument("--fp8", action="store_true", help="enable FP8 training (requires H100+ GPU and torchao)")
-parser.add_argument("--fp8-recipe", type=str, default="tensorwise", choices=["rowwise", "tensorwise"], help="FP8 scaling recipe: tensorwise (faster, recommended) or rowwise (more accurate but slower)")
+parser.add_argument("--tokenizer-backend", type=str, default="transformers", choices=["transformers", "rustbpe"], help="tokenizer backend for Qwen3.5 (default: transformers-compatible PreTrainedTokenizerFast; rustbpe still selectable)")
 # Model architecture
-parser.add_argument("--depth", type=int, default=14, help="depth of the Transformer model")
-# parser.add_argument("--aspect-ratio", type=int, default=64, help="model_dim = depth * aspect_ratio")
+parser.add_argument("--depth", type=int, default=28, help="number of Transformer layers")
 parser.add_argument("--hidden-size", type=int, default=1024, help="hidden size")
-parser.add_argument("--head-dim", type=int, default=128, help="target head dimension for attention")
-parser.add_argument("--num-kv-heads", type=int, default=-1, help="number of key/value heads for GQA (-1 = same as num_attention_heads, i.e. MHA)")
+parser.add_argument("--head-dim", type=int, default=128, help="attention head dimension")
+parser.add_argument("--num-attention-heads", type=int, default=-1, help="number of attention (query) heads (-1 = hidden_size // head_dim). Qwen3.5 decouples head_dim from hidden_size, so this may be set explicitly.")
+parser.add_argument("--intermediate-size", type=int, default=-1, help="MLP intermediate size (-1 = hidden_size * 3)")
+parser.add_argument("--num-kv-heads", type=int, default=-1, help="number of key/value heads for GQA (-1 = same as num_attention_heads)")
 parser.add_argument("--max-seq-len", type=int, default=2048, help="max context length")
-parser.add_argument("--window-pattern", type=str, default="SSSL", help="sliding window pattern tiled across layers: L=full, S=half context (e.g. 'SSL')")
+parser.add_argument("--rope-theta", type=float, default=1000000.0, help="RoPE theta base")
+# Qwen3.5 hybrid layout / linear-attention (GatedDeltaNet) knobs
+parser.add_argument("--full-attention-interval", type=int, default=4, help="every Nth layer is full (softmax) attention; the rest are GatedDeltaNet linear attention")
+parser.add_argument("--linear-conv-kernel-dim", type=int, default=4, help="GatedDeltaNet short conv kernel size")
+parser.add_argument("--linear-num-value-mult", type=int, default=2, help="linear_num_value_heads = num_kv_heads * this (must be an integer multiple). Ignored if --linear-num-value-heads is set.")
+# GatedDeltaNet linear-attention head geometry (decoupled from softmax attention).
+# Each defaults to -1, meaning "derive from head_dim / num_kv_heads" (previous behavior).
+parser.add_argument("--linear-key-head-dim", type=int, default=-1, help="GatedDeltaNet key head dim (-1 = use --head-dim)")
+parser.add_argument("--linear-value-head-dim", type=int, default=-1, help="GatedDeltaNet value head dim (-1 = use --head-dim)")
+parser.add_argument("--linear-num-key-heads", type=int, default=-1, help="GatedDeltaNet number of key heads (-1 = use num_kv_heads)")
+parser.add_argument("--linear-num-value-heads", type=int, default=-1, help="GatedDeltaNet number of value heads (-1 = num_kv_heads * --linear-num-value-mult)")
+parser.add_argument("--partial-rotary-factor", type=float, default=1.0, help="fraction of head_dim that gets rotary embedding (Qwen3.5 2B uses 0.25)")
 # Training horizon (only one used, in order of precedence)
 parser.add_argument("--num-iterations", type=int, default=-1, help="explicit number of optimization steps (-1 = disable)")
 parser.add_argument("--target-flops", type=float, default=-1.0, help="calculate num_iterations to reach target_flops (-1 = disable)")
 parser.add_argument("--target-param-data-ratio", type=float, default=10.5, help="calculate num_iterations to maintain data:param ratio (Chinchilla=20, -1 = disable)")
 # Optimization
-parser.add_argument("--device-batch-size", type=int, default=8, help="per-device batch size. good number to reduce to 16,8,4,... if you OOM on VRAM.")
-# parser.add_argument("--global-batch-size", type=int, default=256, help="all device batch size. good number to reduce to 16,8,4,... if you OOM on VRAM.")
-parser.add_argument("--total-batch-size", type=int, default=-1, help="total batch size in tokens. decent numbers are e.g. 524288. (-1 = auto-compute optimal)")
-parser.add_argument("--lr", type=float, default=3e-3, help="learning rate for embedding parameters (Adam)")
+parser.add_argument("--device-batch-size", type=int, default=8, help="per-device batch size. reduce to 16,8,4,... if you OOM on VRAM.")
+parser.add_argument("--total-batch-size", type=int, default=-1, help="total batch size in tokens, e.g. 524288. (-1 = auto-compute optimal)")
+parser.add_argument("--lr", type=float, default=3e-3, help="learning rate for AdamW params")
 parser.add_argument("--embedding-lr", type=float, default=0.3, help="learning rate for embedding parameters (Adam)")
 parser.add_argument("--unembedding-lr", type=float, default=0.004, help="learning rate for unembedding (lm_head) parameters (Adam)")
-parser.add_argument("--weight-decay", type=float, default=0.2, help="cautious weight decay for the Muon optimizer (for weights)")
+parser.add_argument("--weight-decay", type=float, default=0.2, help="weight decay for the Muon optimizer (for weights)")
 parser.add_argument("--muon-lr", type=float, default=0.02, help="learning rate for matrix parameters (Muon)")
 parser.add_argument("--optimizer-mode", type=str, default="hybrid", choices=["hybrid", "adamw"], help="optimizer setup: hybrid(AdamW+Muon) or adamw")
 parser.add_argument("--ema-decay", type=float, default=0.0, help="EMA decay for model parameters (0 disables EMA, e.g. 0.999)")
@@ -88,18 +98,17 @@ parser.add_argument("--dflash-mask-token-id", type=int, default=-1, help="DFLASH
 parser.add_argument("--dflash-grad-to-target", action="store_true", help="allow DFLASH loss to backprop into the base model (off = detached)")
 parser.add_argument("--dflash-num-blocks", type=int, default=8, help="number of randomly-anchored blocks per sequence")
 parser.add_argument("--dflash-gamma", type=float, default=4.0, help="exp-decay loss weighting gamma (w_k=exp(-(k)/gamma))")
-# parser.add_argument("--scalar-lr", type=float, default=0.5, help="learning rate for scalars (resid_lambdas, x0_lambdas)")
 parser.add_argument("--adam-beta1", type=float, default=0.9, help="Adam beta1 for embedding/unembedding")
 parser.add_argument("--adam-beta2", type=float, default=0.95, help="Adam beta2 for embedding/unembedding")
 parser.add_argument("--warmup-ratio", type=float, default=0.0, help="ratio of iterations for LR warmup")
 parser.add_argument("--warmdown-ratio", type=float, default=0.5, help="ratio of iterations for LR warmdown")
 parser.add_argument("--final-lr-frac", type=float, default=0.0, help="final LR as fraction of initial LR")
 parser.add_argument("--grad-max-norm", type=float, default=-1.0, help="clip-grad-norm")
-parser.add_argument("--lr-schedule", type=str, default="default", choices=["linear", "cosine", "default"], help="LR decay schedule during warmdown: linear or cosine")
+parser.add_argument("--lr-schedule", type=str, default="default", choices=["linear", "cosine", "default"], help="LR decay schedule during warmdown")
 parser.add_argument("--resume-from-step", type=int, default=-1, help="resume training from this step (-1 = disable)")
-parser.add_argument("--init-from", type=str, default="", help="checkpoint directory to initialize model weights from (no optimizer/schedule restore, just weights)")
+parser.add_argument("--init-from", type=str, default="", help="checkpoint directory to initialize model weights from")
 parser.add_argument("--init-step", type=int, default=-1, help="step of the checkpoint to load for --init-from (-1 = latest)")
-parser.add_argument("--end-step", type=int, default=-1, help="stop THIS training session at this step (-1 = disable). Note: this does NOT change the model's full training horizon / LR schedule (still based on num_iterations); it only pauses the current run early so it can be resumed later via --resume-from-step.")
+parser.add_argument("--end-step", type=int, default=-1, help="stop THIS training session at this step (-1 = disable)")
 # Evaluation
 parser.add_argument("--eval-every", type=int, default=250, help="evaluate val bpb every N steps (-1 = disable)")
 parser.add_argument("--eval-tokens", type=int, default=40*524288, help="number of tokens to evaluate val loss on")
@@ -107,11 +116,11 @@ parser.add_argument("--core-metric-every", type=int, default=5000, help="evaluat
 parser.add_argument("--core-metric-max-per-task", type=int, default=-1, help="examples per task for CORE metric")
 parser.add_argument("--sample-every", type=int, default=2000, help="sample from model every N steps (-1 = disable)")
 parser.add_argument("--save-every", type=int, default=-1, help="save checkpoints every N steps (-1 = only at end)")
-parser.add_argument("--save-format", type=str, default="pt", choices=["pt", "hf", "both"], help="checkpoint export format: pt (nanochat .pt + meta), hf (transformers config.json+safetensors+tokenizer), or both")
+parser.add_argument("--save-format", type=str, default="pt", choices=["pt", "hf", "both"], help="checkpoint export format")
 # Output
 parser.add_argument("--model-tag", type=str, default=None, help="override model tag for checkpoint directory name")
 # Depth expansion (model growth)
-parser.add_argument("--expand-from", type=str, default=None, help="path to a smaller checkpoint to expand from (auto depth-expand if it has fewer layers than --depth)")
+parser.add_argument("--expand-from", type=str, default=None, help="path to a smaller checkpoint to expand from")
 parser.add_argument("--expand-from-step", type=int, default=-1, help="step of the checkpoint to expand from (-1 = latest)")
 args = parser.parse_args()
 user_config = vars(args).copy()  # for logging
@@ -120,7 +129,7 @@ user_config = vars(args).copy()  # for logging
 
 device_type = autodetect_device_type() if args.device_type == "" else args.device_type
 ddp, ddp_rank, ddp_local_rank, ddp_world_size, device = compute_init(device_type)
-master_process = ddp_rank == 0 # this process will do logging, checkpointing etc.
+master_process = ddp_rank == 0
 autocast_ctx = torch.amp.autocast(device_type=device_type, dtype=torch.bfloat16) if device_type == "cuda" else nullcontext()
 synchronize = torch.cuda.synchronize if device_type == "cuda" else lambda: None
 get_max_memory = torch.cuda.max_memory_allocated if device_type == "cuda" else lambda: 0
@@ -129,26 +138,21 @@ if device_type == "cuda":
     gpu_peak_flops = get_peak_flops(gpu_device_name)
     print0(f"GPU: {gpu_device_name} | Peak FLOPS (BF16): {gpu_peak_flops:.2e}")
 else:
-    gpu_peak_flops = float('inf')  # MFU not meaningful for CPU/MPS
+    gpu_peak_flops = float('inf')
 
-# wandb logging init
 use_dummy_wandb = args.run == "dummy" or not master_process
 wandb_run = DummyWandb() if use_dummy_wandb else wandb.init(project="nanochat", name=args.run, config=user_config)
 
-# Flash Attention status
 if HAS_FA3:
     print0("✓ Using Flash Attention 3 (Hopper GPU detected), efficient, new and awesome.")
 else:
     print0("!" * 80)
     print0("WARNING: Flash Attention 3 not available, using PyTorch SDPA fallback")
     print0("WARNING: Training will be less efficient without FA3")
-    if args.window_pattern != "L":
-        print0(f"WARNING: SDPA has no support for sliding window attention (window_pattern='{args.window_pattern}'). Your GPU utilization will be terrible.")
-        print0("WARNING: Recommend using --window-pattern L for full context attention without alternating sliding window patterns.")
     print0("!" * 80)
 
 # -----------------------------------------------------------------------------
-# Tokenizer will be useful for evaluation and also we need the vocab size to init the model
+# Tokenizer (transformers-compatible by default). Also gives us the vocab size.
 tokenizer = get_tokenizer(backend=args.tokenizer_backend)
 token_bytes = get_token_bytes(device=device, backend=args.tokenizer_backend)
 print0(f"Tokenizer backend: {args.tokenizer_backend}")
@@ -156,48 +160,69 @@ vocab_size = tokenizer.get_vocab_size()
 print0(f"Vocab size: {vocab_size:,}")
 # -----------------------------------------------------------------------------
 def build_model_meta(depth, hidden_size_override=None, num_kv_heads_override=None):
-    # from transformers import AutoConfig,AutoModelForCausalLM
-    # config = AutoConfig.from_pretrained
-    from nanochat.qwen3 import Qwen3Config, Qwen3ForCausalLM
-    #TODO set tie_word_embeddings for easy train first
-    # tie_word_embeddings=Ture
-    ## layers= 28
+    from nanochat.qwen35 import Qwen3_5TextConfig, Qwen3_5ForCausalLM
     layers = depth
     hidden_size = hidden_size_override if hidden_size_override is not None else args.hidden_size
     head_dim = args.head_dim
-    num_attention_heads = hidden_size//head_dim
+    num_attention_heads = args.num_attention_heads if args.num_attention_heads > 0 else hidden_size // head_dim
     num_kv_heads = num_kv_heads_override if num_kv_heads_override is not None else (args.num_kv_heads if args.num_kv_heads > 0 else num_attention_heads)
-    intermediate_size = hidden_size * 3
-    config = Qwen3Config(head_dim=head_dim, hidden_act="silu", hidden_size=hidden_size,initializer_range=0.02,intermediate_size=intermediate_size,max_position_embeddings=args.max_seq_len*10,max_window_layers=layers,model_type="qwen3",
-                num_hidden_layers=layers,num_key_value_heads=num_kv_heads,rms_norm_eps=1e-6,tie_word_embeddings=False,vocab_size=vocab_size,use_cache=False, num_attention_heads=num_attention_heads)
+    intermediate_size = args.intermediate_size if args.intermediate_size > 0 else hidden_size * 3
+    # GatedDeltaNet (linear attention) head configuration. These are decoupled from the
+    # softmax-attention head_dim / num_kv_heads; each override defaults to the previous
+    # derive-from-attention behavior when left at -1.
+    linear_key_head_dim = args.linear_key_head_dim if args.linear_key_head_dim > 0 else head_dim
+    linear_value_head_dim = args.linear_value_head_dim if args.linear_value_head_dim > 0 else head_dim
+    linear_num_key_heads = args.linear_num_key_heads if args.linear_num_key_heads > 0 else num_kv_heads
+    linear_num_value_heads = (
+        args.linear_num_value_heads if args.linear_num_value_heads > 0
+        else max(1, args.linear_num_value_mult) * num_kv_heads
+    )
+    config = Qwen3_5TextConfig(
+        vocab_size=vocab_size,
+        hidden_size=hidden_size,
+        intermediate_size=intermediate_size,
+        num_hidden_layers=layers,
+        num_attention_heads=num_attention_heads,
+        num_key_value_heads=num_kv_heads,
+        head_dim=head_dim,
+        hidden_act="silu",
+        max_position_embeddings=args.max_seq_len * 10,
+        initializer_range=0.02,
+        rms_norm_eps=1e-6,
+        tie_word_embeddings=False,
+        use_cache=False,
+        rope_theta=args.rope_theta,
+        partial_rotary_factor=args.partial_rotary_factor,
+        full_attention_interval=args.full_attention_interval,
+        linear_conv_kernel_dim=args.linear_conv_kernel_dim,
+        linear_key_head_dim=linear_key_head_dim,
+        linear_value_head_dim=linear_value_head_dim,
+        linear_num_key_heads=linear_num_key_heads,
+        linear_num_value_heads=linear_num_value_heads,
+    )
     config.mtp_num_heads = max(0, int(args.mtp_num_heads))
     config.mtp_weight = max(0.0, float(args.mtp_weight))
     with torch.device("meta"):
-        model_meta = Qwen3ForCausalLM(config)
+        model_meta = Qwen3_5ForCausalLM(config)
     return model_meta
 
 # Build the model, move to device, init the weights
-model = build_model_meta(args.depth) # 1) Build on meta device (only shapes/dtypes, no data)
+model = build_model_meta(args.depth)  # 1) Build on meta device (only shapes/dtypes, no data)
 model.to(torch.float32)
 print0(model.__class__.__name__)
 model_config = model.config
-
 print0(model_config)
-model.to_empty(device=device) # 2) All tensors get storage on target device but with uninitialized (garbage) data
-model.post_init() # 3) All tensors get initialized
+print0(f"Layer types: {model_config.layer_types}")
+model.to_empty(device=device)  # 2) storage on device but uninitialized
+model.post_init()              # 3) initialize tensors
 model.re_init_weights()
 
 # ---- Depth Expansion (Model Growth) ----
-# If --expand-from is set, load a smaller checkpoint and expand its layers to match --depth.
-# Strategy: function-preserving expansion by zeroing output projections (o_proj, down_proj) of new layers.
 if args.expand_from is not None:
     from scripts.grow_depth import expand_layers_depth
-    import copy
 
     expand_dir = args.expand_from
-    # Load the source checkpoint
     if args.expand_from_step == -1:
-        # Find the latest step in the expand-from directory
         import glob as _glob
         model_files = _glob.glob(os.path.join(expand_dir, "model_step*.pt"))
         if not model_files:
@@ -213,7 +238,6 @@ if args.expand_from is not None:
     print0(f"[Depth Expansion] Loading source checkpoint: {expand_model_path}")
     expand_state = torch.load(expand_model_path, map_location=device, weights_only=False)
 
-    # Detect source layer count from state_dict keys
     src_layer_keys = [k for k in expand_state.keys() if "model.layers." in k]
     src_layer_indices = set()
     for k in src_layer_keys:
@@ -223,88 +247,69 @@ if args.expand_from is not None:
             src_layer_indices.add(idx)
     src_n_layers = max(src_layer_indices) + 1 if src_layer_indices else 0
     tgt_n_layers = args.depth
-
     if src_n_layers == 0:
-        raise ValueError(f"[Depth Expansion] Could not detect layer count from source checkpoint")
+        raise ValueError("[Depth Expansion] Could not detect layer count from source checkpoint")
 
     if src_n_layers == tgt_n_layers:
-        # Same depth - just load directly
         print0(f"[Depth Expansion] Source has same depth ({src_n_layers}), loading weights directly.")
         model.load_state_dict(expand_state, strict=False, assign=True)
     elif src_n_layers < tgt_n_layers:
-        print0(f"[Depth Expansion] Expanding depth: {src_n_layers} -> {tgt_n_layers} layers ({tgt_n_layers/src_n_layers:.2f}x)")
-
-        # Build a temporary source model with the source depth to load weights cleanly
+        print0(f"[Depth Expansion] Expanding depth: {src_n_layers} -> {tgt_n_layers} layers")
         src_model = build_model_meta(src_n_layers)
         src_model.to_empty(device=device)
         src_model.post_init()
         src_model.load_state_dict(expand_state, strict=False, assign=True)
-
-        # Expand the layer ModuleList with function-preserving init (zero o_proj and down_proj)
-        zero_proj_names = ["o_proj.weight", "down_proj.weight"]
+        zero_proj_names = ["o_proj.weight", "down_proj.weight", "out_proj.weight"]
         expanded_layers = expand_layers_depth(src_model.model.layers, tgt_n_layers, zero_proj_names)
-
-        # Copy non-layer params from source (embeddings, norm, lm_head)
         model.model.embed_tokens.load_state_dict(src_model.model.embed_tokens.state_dict())
         model.model.norm.load_state_dict(src_model.model.norm.state_dict())
         model.lm_head.load_state_dict(src_model.lm_head.state_dict())
-        # Copy MTP heads if they exist
         if hasattr(src_model, 'mtp_heads') and len(src_model.mtp_heads) > 0:
             for i, head in enumerate(src_model.mtp_heads):
                 if i < len(model.mtp_heads):
                     model.mtp_heads[i].load_state_dict(head.state_dict())
-
-        # Replace the layers in the target model
         model.model.layers = expanded_layers
-
-        # Fix layer_idx in attention modules (important for KV cache correctness)
         for idx, layer in enumerate(model.model.layers):
             if hasattr(layer, 'self_attn'):
                 layer.self_attn.layer_idx = idx
-
-        # Update layer_types in config if needed
-        if hasattr(model.config, 'layer_types'):
-            src_types = src_model.config.layer_types if hasattr(src_model.config, 'layer_types') else ["full_attention"] * src_n_layers
-            new_types = [src_types[i % len(src_types)] for i in range(tgt_n_layers)]
-            model.config.layer_types = new_types
-            model.config.num_hidden_layers = tgt_n_layers
-
+            if hasattr(layer, 'linear_attn'):
+                layer.linear_attn.layer_idx = idx
         del src_model, expand_state
         if device_type == "cuda":
             torch.cuda.empty_cache()
-
-        # Verify: quick forward pass to check no NaN
-        print0(f"[Depth Expansion] Verifying expanded model...")
+        print0("[Depth Expansion] Verifying expanded model...")
         model.eval()
         test_ids = torch.randint(0, vocab_size, (1, 32), device=device)
         with torch.no_grad(), autocast_ctx:
             test_logits = model(test_ids)
-            if hasattr(test_logits, 'logits'):
-                test_logits = test_logits.logits
         assert not torch.isnan(test_logits).any(), "NaN detected in expanded model output!"
-        print0(f"[Depth Expansion] ✅ Expansion successful! Model output is valid.")
+        print0("[Depth Expansion] ✅ Expansion successful! Model output is valid.")
         model.train()
     else:
-        raise ValueError(f"[Depth Expansion] Source has MORE layers ({src_n_layers}) than target ({tgt_n_layers}). Cannot shrink.")
+        raise ValueError(f"[Depth Expansion] Source has MORE layers ({src_n_layers}) than target ({tgt_n_layers}).")
 
 # If we are resuming, overwrite the model parameters with those of the checkpoint
 base_dir = get_base_dir()
-output_dirname = args.model_tag if args.model_tag else f"d{args.depth}" # e.g. d12
+output_dirname = args.model_tag if args.model_tag else f"qwen3p5_d{args.depth}"
 checkpoint_dir = os.path.join(base_dir, "base_checkpoints", output_dirname)
 resuming = args.resume_from_step != -1
 optimizer_data = None
 meta_data = None
-if resuming:#  TODO this have bugs
+if resuming:
     print0(f"Resuming optimization from step {args.resume_from_step}")
-    # Auto-detect checkpoint format (nanochat .pt or HF hf_<step>/ dir)
     model_data, optimizer_data, meta_data = load_checkpoint_any(checkpoint_dir, args.resume_from_step, device, load_optimizer=True, rank=ddp_rank)
+    # Drop the legacy `_softcap_step` buffer if present: it is now a non-persistent buffer
+    # and no longer part of the model state_dict (strict=True would otherwise reject it).
+    model_data.pop("_softcap_step", None)
     model.load_state_dict(model_data, strict=True, assign=True)
-    del model_data # free up this memory after the copy
+    # `_softcap_step` is a non-persistent buffer (not in the checkpoint), so re-sync it
+    # from the resumed step to keep the logit-softcap annealing schedule correct.
+    if hasattr(model, "set_softcap_step"):
+        model.set_softcap_step(args.resume_from_step)
+    del model_data
 elif args.init_from:
-    # Initialize model weights from a checkpoint directory (no optimizer/schedule restore)
     init_dir = os.path.expanduser(args.init_from)
     if args.init_step == -1:
-        # Find latest step in the init directory
         import re as _re, glob as _glob
         model_files = _glob.glob(os.path.join(init_dir, "model_*.pt"))
         if not model_files:
@@ -315,98 +320,18 @@ elif args.init_from:
         init_step = args.init_step
     print0(f"Initializing model weights from {init_dir} step {init_step} (no optimizer/schedule restore)")
     init_model_data, _, _ = load_checkpoint(init_dir, init_step, device, load_optimizer=False)
-    # Load with strict=False to allow architecture differences (e.g. different head count)
     missing, unexpected = model.load_state_dict(init_model_data, strict=False, assign=True)
     if missing:
-        print0(f"  Warning: {len(missing)} missing keys (will be randomly initialized): {missing[:5]}...")
+        print0(f"  Warning: {len(missing)} missing keys (randomly initialized): {missing[:5]}...")
     if unexpected:
         print0(f"  Warning: {len(unexpected)} unexpected keys (ignored): {unexpected[:5]}...")
     del init_model_data
 
 # -----------------------------------------------------------------------------
-# FP8 training initialization and management (this has to be done before torch.compile)
-
-# Convert Linear layers to Float8Linear if --fp8 is set
-if args.fp8:
-    if device_type != "cuda":
-        print0("Warning: FP8 training requires CUDA, ignoring --fp8 flag")
-    else:
-        # our custom fp8 is simpler than torchao, written for exact API compatibility
-        from nanochat.fp8 import Float8LinearConfig, convert_to_float8_training
-        # from torchao.float8 import Float8LinearConfig, convert_to_float8_training
-        import torch.nn as nn
-
-        # Filter: dims must be divisible by 16 (FP8 hardware requirement) large enough
-        def fp8_module_filter(mod: nn.Module, fqn: str) -> bool:
-            if not isinstance(mod, nn.Linear):
-                return False
-            if mod.in_features % 16 != 0 or mod.out_features % 16 != 0:
-                return False
-            if min(mod.in_features, mod.out_features) < 128:
-                return False
-            return True
-
-        fp8_config = Float8LinearConfig.from_recipe_name(args.fp8_recipe)
-        num_linear = sum(1 for m in model.modules() if isinstance(m, nn.Linear))
-        convert_to_float8_training(model, config=fp8_config, module_filter_fn=fp8_module_filter)
-        num_fp8 = sum(1 for m in model.modules() if 'Float8' in type(m).__name__)
-        num_skipped = num_linear - num_fp8
-        print0(f"✓ FP8 training enabled ({args.fp8_recipe} scaling) - converted {num_fp8}/{num_linear} linear layers, skipped {num_skipped} (too small)")
-
-# Context manager to temporarily disable FP8 so that model evaluation remains in BF16
-@contextmanager
-def disable_fp8(model):
-    """Temporarily swap Float8Linear modules with nn.Linear for BF16 evaluation.
-
-    CastConfig is a frozen dataclass, so we can't mutate scaling_type. Instead,
-    we swap out Float8Linear modules entirely and restore them after.
-    """
-    import torch.nn as nn
-
-    # Find all Float8Linear modules and their locations
-    fp8_locations = []  # list of (parent_module, attr_name, fp8_module)
-    for name, module in model.named_modules():
-        if 'Float8' in type(module).__name__:
-            if '.' in name:
-                parent_name, attr_name = name.rsplit('.', 1)
-                parent = model.get_submodule(parent_name)
-            else:
-                parent = model
-                attr_name = name
-            fp8_locations.append((parent, attr_name, module))
-
-    if not fp8_locations:
-        yield  # No FP8 modules, nothing to do
-        return
-
-    # Swap Float8Linear -> nn.Linear (shares the same weight tensor, no copy)
-    for parent, attr_name, fp8_module in fp8_locations:
-        linear = nn.Linear(
-            fp8_module.in_features,
-            fp8_module.out_features,
-            bias=fp8_module.bias is not None,
-            device=fp8_module.weight.device,
-            dtype=fp8_module.weight.dtype,
-        )
-        linear.weight = fp8_module.weight  # share, don't copy
-        if fp8_module.bias is not None:
-            linear.bias = fp8_module.bias
-        setattr(parent, attr_name, linear)
-
-    try:
-        yield
-    finally:
-        # Restore Float8Linear modules
-        for parent, attr_name, fp8_module in fp8_locations:
-            setattr(parent, attr_name, fp8_module)
-
+# EMA helpers
 
 def init_ema_state(model):
-    return {
-        name: p.detach().clone()
-        for name, p in model.named_parameters()
-        if p.requires_grad
-    }
+    return {name: p.detach().clone() for name, p in model.named_parameters() if p.requires_grad}
 
 
 @torch.no_grad()
@@ -422,7 +347,6 @@ def apply_ema_weights(model, ema_state):
     if not ema_state:
         yield
         return
-
     backup = {}
     try:
         for name, p in model.named_parameters():
@@ -436,30 +360,22 @@ def apply_ema_weights(model, ema_state):
                 p.data.copy_(backup[name])
 
 # -----------------------------------------------------------------------------
-# Compile the model
-
-orig_model = model # original, uncompiled model, for saving raw model state_dict and for inference/evaluation (because the shapes may change shape)
-# model = torch.compile(model, dynamic=False) # may cause nan issue the inputs to model will never change shape so dynamic=False is safe
+orig_model = model  # uncompiled model, for saving/eval/inference
 print0(orig_model.dtype)
 
-# Wrap the model in DistributedDataParallel for multi-GPU training.
-# CRITICAL: the plain torch.optim.AdamW / torch.optim.Muon used below do NOT synchronize
-# gradients across ranks. Without DDP, every rank would train an independent model on its own
-# data shard and only rank0's (severely under-trained) model would be saved/evaluated.
-# DDP all-reduces (averages) gradients across ranks during backward, fixing this.
 if ddp:
     from torch.nn.parallel import DistributedDataParallel as DDP
     model = DDP(model, device_ids=[ddp_local_rank], broadcast_buffers=True)
     print0(f"Wrapped model in DistributedDataParallel (world_size={ddp_world_size})")
 
 # -----------------------------------------------------------------------------
-# DFLASH draft model (jointly trained during pretraining)
+# DFLASH draft model (optional, jointly trained during pretraining)
 draft_model = None
 draft_layer_ids = None
 dflash_mask_token_id = None
 if args.dflash_enable:
     import sys as _sys
-    _sys.path.insert(0, os.path.join(os.path.dirname(__file__), "..", "dflash"))
+    _sys.path.insert(0, os.path.join(os.path.dirname(__file__), "..", "..", "dflash"))
     from dflash.model import DFlashDraftModel, build_target_layer_ids, extract_context_feature
     from transformers.models.qwen3.modeling_qwen3 import Qwen3Config as HFQwen3Config
     num_heads = args.hidden_size // args.head_dim
@@ -482,127 +398,65 @@ if args.dflash_enable:
         from torch.nn.parallel import DistributedDataParallel as DDP
         draft_model = DDP(draft_model, device_ids=[ddp_local_rank], broadcast_buffers=True)
     print0(f"DFLASH draft enabled: layers={args.dflash_layers} block={args.dflash_block_size} layer_ids={draft_layer_ids} mask_id={dflash_mask_token_id}")
+
 # -----------------------------------------------------------------------------
-# Scaling laws and muP extrapolations to determine the optimal training horizon, batch size, learning rates, weight decay.
-
-# Get the parameter counts of our model
-# num_params = sum(p.numel() for p in model.parameters())
-#
-#
-# print0(f"Estimated FLOPs per token: {num_flops_per_token:e}")
-
-# 1) Use scaling laws to determine the optimal training horizon in tokens
-# The compute-optimal models satisfy the Tokens:Params ratio of --target-param-data-ratio (derived experimentally via scaling laws analysis).
-# We've already initialized the model so we have Params. Optimal Tokens is now simply target-param-data-ratio * Params
-# def get_scaling_params(m):
-#     # As for which params to use exactly, transformer matrices + lm_head gives cleanest scaling laws (see dev/LOG.md Jan 27, 2026)
-#     params_counts = m.num_scaling_params()
-#     scaling_params = params_counts['transformer_matrices'] + params_counts['lm_head']
-#     return scaling_params
-# num_scaling_params = get_scaling_params(model)
+# Scaling laws / batch size / LR corrections
 num_params = sum(p.numel() for p in model.parameters())
 print0(f"Parameters: {num_params/1e9:.3f}B")
 
-target_tokens = int(args.target_param_data_ratio * num_params) # optimal tokens for the model we are about to train
-B_REF = 256*2048  # reference batch size in tokens (for d28, hidden_size=1024)
-d_ref_model = build_model_meta(28, hidden_size_override=1024)  # reference model: d28, hidden_size=1024
+target_tokens = int(args.target_param_data_ratio * num_params)
+B_REF = 256 * 2048
+d_ref_model = build_model_meta(28, hidden_size_override=1024)
 d_ref_params = sum(p.numel() for p in d_ref_model.parameters())
-D_REF = num_params / d_ref_params  # ratio of current model size to reference model size
+D_REF = num_params / d_ref_params
 del d_ref_model
-total_batch_size = args.total_batch_size # user-provided override is possible
+total_batch_size = args.total_batch_size
 if total_batch_size == -1:
-    batch_size_ratio = D_REF
-    predicted_batch_size = B_REF * batch_size_ratio ** 0.383
-    total_batch_size = 2 ** round(math.log2(predicted_batch_size)) # clamp to nearest power of 2 for efficiency
+    predicted_batch_size = B_REF * D_REF ** 0.383
+    total_batch_size = 2 ** round(math.log2(predicted_batch_size))
     print0(f"Auto-computed optimal batch size: {total_batch_size:,} tokens")
 
-# When resuming, ALWAYS keep total_batch_size identical to the run that produced the checkpoint.
-# total_batch_size = tokens per optimizer step; num_iterations = target_tokens // total_batch_size,
-# and the LR warmup/warmdown schedule is derived from num_iterations. If total_batch_size differs
-# (e.g. resuming with a different GPU count / batch settings), num_iterations and the schedule would
-# no longer align with the saved `step`, silently corrupting the resume. So we force it to match.
 if resuming and meta_data is not None and meta_data.get("total_batch_size") is not None:
     ckpt_total_batch_size = int(meta_data["total_batch_size"])
     if total_batch_size != ckpt_total_batch_size:
-        print0(
-            f"[Resume] Overriding total_batch_size {total_batch_size:,} -> {ckpt_total_batch_size:,} "
-            f"(from checkpoint) to keep num_iterations / LR schedule consistent with the saved step."
-        )
+        print0(f"[Resume] Overriding total_batch_size {total_batch_size:,} -> {ckpt_total_batch_size:,} (from checkpoint).")
     total_batch_size = ckpt_total_batch_size
-# Our reference model is d12, this is where a lot of hyperparameters are tuned and then transfered to higher depths (muP style)
-# d12_ref = build_model_meta(12) # creates the model on meta device
-# D_REF = args.target_param_data_ratio * get_scaling_params(d12_ref) # compute-optimal d12 training horizon in tokens (measured empirically)
-# B_REF = 2**19 # optimal batch size at d12 ~= 524,288 tokens (measured empirically)
-#
-# # 2) Now that we have the token horizon, we can calculate the optimal batch size
-# # We follow the Power Lines paper (Bopt ∝ D^0.383), ref: https://arxiv.org/abs/2505.13738
-# # The optimal batch size grows as approximately D^0.383, so e.g. if D doubles from d12 to d24, B should grow by 2^0.383 ≈ 1.3x.
-# total_batch_size = args.total_batch_size # user-provided override is possible
-# if total_batch_size == -1:
-#     batch_size_ratio = target_tokens / D_REF
-#     predicted_batch_size = B_REF * batch_size_ratio ** 0.383
-#     total_batch_size = 2 ** round(math.log2(predicted_batch_size)) # clamp to nearest power of 2 for efficiency
-#     print0(f"Auto-computed optimal batch size: {total_batch_size:,} tokens")
 
-# 3) Knowing the batch size, we can now calculate a learning rate correction (bigger batch size allows higher learning rates)
-batch_ratio = total_batch_size / B_REF  # B/B_ref
-if batch_ratio != 1.0:
-    # AdamW/Muon: sqrt scaling is standard: η ∝ √(B/B_ref)
-    batch_lr_scale = batch_ratio ** 0.5
+batch_ratio = total_batch_size / B_REF
+batch_lr_scale = batch_ratio ** 0.5 if batch_ratio != 1.0 else 1.0
+if batch_lr_scale != 1.0:
     print0(f"Scaling LRs by {batch_lr_scale:.4f} for batch size {total_batch_size:,} (reference: {B_REF:,})")
-else:
-    batch_lr_scale = 1.0
 
-# 4) Weight decay scaling: λ = λ_ref · √(B/B_ref) · (D_ref/D)
-# Adopt T_epoch framework from https://arxiv.org/abs/2405.13698
-# Keep T_epoch = B/(η·λ·D) constant across model sizes.
 weight_decay_scaled = args.weight_decay * math.sqrt(total_batch_size / B_REF) * (1.0 / max(D_REF, 1.0))
 if weight_decay_scaled != args.weight_decay:
     print0(f"Scaling weight decay from {args.weight_decay:.6f} to {weight_decay_scaled:.6f} for depth {args.depth}")
-else:
-    weight_decay_scaled = args.weight_decay
 
-batch_size = 256
-# total_batch_size = args.max_seq_len*batch_size
-# num_iterations = 10000 # TODO
 lr = args.lr * batch_lr_scale
 weight_decay = args.weight_decay
-# weight_decay_scaled already computed above via T_epoch scaling
-# Optimizer
-# Split weights in two groups, one with weight decay and the other not.
-no_decay = ["bias", "norm.weight"]  # norm.weight change by wenhua
-# all_p = [n for n, p in model.named_parameters()]
-# print(all_p,flush=True)
-no_decay_p = [n for n, p in model.named_parameters() if any(nd in n for nd in no_decay)]
-# optimizer_grouped_parameters = [
-#     # {
-#     #     "params": [p for n, p in model.named_parameters() if not any(nd in n for nd in no_decay)],
-#     #     "weight_decay": weight_decay,
-#     # },
-#     {
-#         "params": [p for n, p in model.named_parameters() if any(nd in n for nd in no_decay)],
-#         "weight_decay": 0.0,
-#     },
-# ]
-optimizer_grouped_parameters = []
+no_decay = ["bias", "norm.weight"]
+
+# -----------------------------------------------------------------------------
+# Optimizer parameter grouping.
+# NOTE vs qwen3: the GatedDeltaNet introduces non-2D params (A_log, dt_bias 1D;
+# conv1d.weight 3D). Muon only handles 2D matrices, so any non-2D param is routed
+# to the AdamW (no weight decay) group instead of the Muon default group.
 base_fan_in = 1024
-embed_params=[]
+embed_params = []
 other_params = {}
-no_weight_decay = {"params":[],  "weight_decay": 0.0,}
+no_weight_decay = {"params": [], "weight_decay": 0.0}
 muon_lr = args.muon_lr
-matrix_lr = muon_lr if muon_lr>0 else lr
-default_group = {"params":[], "lr":matrix_lr}
-lm_head_params=[]
+matrix_lr = muon_lr if muon_lr > 0 else lr
+default_group = {"params": [], "lr": matrix_lr}
+lm_head_params = []
 adamw_all_params = []
 
-
-for n,m in model.named_parameters():
+for n, m in model.named_parameters():
     is_no_decay = any(nd in n for nd in no_decay)
     is_embed = "embed" in n
     is_lm_head = "lm_head" in n
 
-    # AdamW-all mode groups (all params are optimized by AdamW)
-    if is_no_decay:
+    # AdamW-all mode groups (all params optimized by AdamW)
+    if is_no_decay or (m.dim() != 2):
         adamw_all_params.append({"params": [m], "lr": args.lr, "weight_decay": 0.0})
     elif is_embed:
         adamw_all_params.append({"params": [m], "lr": args.embedding_lr, "weight_decay": 0.0})
@@ -611,14 +465,15 @@ for n,m in model.named_parameters():
     else:
         adamw_all_params.append({"params": [m], "lr": args.lr, "weight_decay": weight_decay_scaled})
 
-    if any(nd in n for nd in no_decay):
+    # Hybrid mode groups
+    if is_no_decay or (m.dim() != 2):
+        # 1D/3D params (norms, biases, A_log, dt_bias, conv1d.weight) -> AdamW, no wd
         no_weight_decay["params"].append(m)
-    elif "lm_head" in n:
-        lm_head_params.append({"params": [m], "lr": args.lr, "weight_decay": 0.0, })
-    elif "embed" in n:
-        embed_params.append({"params":[m],"lr":args.embedding_lr, "weight_decay": 0.0,}) # this could be change
-    elif "norm" not in n and len(m.shape)==2 and m.shape[-1]!=base_fan_in:
-        # matrix params whose fan_in != base_fan_in (e.g. down_proj: in=intermediate_size) -> Muon
+    elif is_lm_head:
+        lm_head_params.append({"params": [m], "lr": args.lr, "weight_decay": 0.0})
+    elif is_embed:
+        embed_params.append({"params": [m], "lr": args.embedding_lr, "weight_decay": 0.0})
+    elif m.shape[-1] != base_fan_in:
         fan_in = m.shape[-1]
         if fan_in not in other_params:
             other_params[fan_in] = {"lr": matrix_lr, "params": [m]}
@@ -626,39 +481,33 @@ for n,m in model.named_parameters():
             other_params[fan_in]["params"].append(m)
     else:
         default_group["params"].append(m)
-optimizer_grouped_parameters.append(no_weight_decay)
+
+optimizer_grouped_parameters = [no_weight_decay]
 optimizer_grouped_parameters.extend(embed_params)
 optimizer_grouped_parameters.extend(lm_head_params)
-# optimizer_grouped_parameters.extend(other_params.values())
-# optimizer_grouped_parameters.append(default_group)
 
 if args.optimizer_mode == "adamw":
     optimizer = torch.optim.AdamW(
-        adamw_all_params,
-        lr=lr,
-        weight_decay=weight_decay_scaled,
-        betas=(args.adam_beta1, args.adam_beta2),
-        eps=1e-10,
+        adamw_all_params, lr=lr, weight_decay=weight_decay_scaled,
+        betas=(args.adam_beta1, args.adam_beta2), eps=1e-10,
     )
 else:
     optimizer = torch.optim.AdamW(
-        optimizer_grouped_parameters,
-        lr=lr,
-        weight_decay=weight_decay_scaled,
-        betas=(args.adam_beta1, args.adam_beta2),
-        eps=1e-10,
-    )  # betas are changed by wenhua
+        optimizer_grouped_parameters, lr=lr, weight_decay=weight_decay_scaled,
+        betas=(args.adam_beta1, args.adam_beta2), eps=1e-10,
+    )
 print0(f"Optimizer mode: {args.optimizer_mode}")
 
-# Only create muon_optimizer if muon_lr >= 0
 muon_optimizer = None
 if args.optimizer_mode == "hybrid" and args.muon_lr >= 0:
-    moun_parameters=[]
+    moun_parameters = []
     moun_parameters.extend(other_params.values())
-    moun_parameters.append(default_group)
-    muon_optimizer = torch.optim.Muon(moun_parameters, weight_decay=weight_decay_scaled, adjust_lr_fn="match_rms_adamw",lr=muon_lr)
-    for group in muon_optimizer.param_groups:
-        group["initial_lr"] = group["lr"]
+    if default_group["params"]:
+        moun_parameters.append(default_group)
+    if moun_parameters:
+        muon_optimizer = torch.optim.Muon(moun_parameters, weight_decay=weight_decay_scaled, adjust_lr_fn="match_rms_adamw", lr=muon_lr)
+        for group in muon_optimizer.param_groups:
+            group["initial_lr"] = group["lr"]
 
 for group in optimizer.param_groups:
     group["initial_lr"] = group["lr"]
@@ -668,7 +517,6 @@ if args.ema_decay > 0:
     ema_state = init_ema_state(orig_model)
     print0(f"EMA enabled (decay={args.ema_decay})")
 
-# Optimizer for the DFLASH draft (trained jointly, kept separate from base optimizers)
 draft_optimizer = None
 if draft_model is not None:
     draft_optimizer = torch.optim.AdamW(draft_model.parameters(), lr=args.lr, weight_decay=0.0, betas=(0.9, 0.95))
@@ -676,9 +524,6 @@ if draft_model is not None:
         group["initial_lr"] = group["lr"]
 
 if resuming:
-    # Backward compatible optimizer restore:
-    # - old checkpoints: optimizer_data is AdamW state_dict
-    # - new checkpoints: optimizer_data is {"adamw": ..., "muon": ...}
     if isinstance(optimizer_data, dict) and "adamw" in optimizer_data:
         optimizer.load_state_dict(optimizer_data["adamw"])
         if muon_optimizer is not None and optimizer_data.get("muon") is not None:
@@ -692,11 +537,10 @@ if resuming:
     del optimizer_data
 
 # -----------------------------------------------------------------------------
-# Initialize the DataLoaders for train/val
+# DataLoaders
 dataloader_resume_state_dict = None if not resuming else meta_data["dataloader_state_dict"]
 data_dir = args.data_dir if args.data_dir else None
 
-# Print dataset summary so user can verify data sources
 from nanochat.dataset import print_dataset_summary
 print0("=" * 60)
 if master_process:
@@ -705,61 +549,44 @@ print0("=" * 60)
 
 train_loader = tokenizing_distributed_data_loader_with_state_bos_bestfit(tokenizer, args.device_batch_size, args.max_seq_len, split="train", device=device, resume_state_dict=dataloader_resume_state_dict, data_dir=data_dir, shuffle_files=args.shuffle_files)
 build_val_loader = lambda: tokenizing_distributed_data_loader_bos_bestfit(tokenizer, args.device_batch_size, args.max_seq_len, split="val", device=device, data_dir=data_dir)
-x, y, dataloader_state_dict = next(train_loader) # kick off load of the very first batch of data
+x, y, dataloader_state_dict = next(train_loader)
 
 # -----------------------------------------------------------------------------
-# Calculate the number of iterations we will train for and set up the various schedulers
-
-# num_iterations: either it is given, or from target flops, or from target data:param ratio (in that order)
-# assert args.num_iterations > 0 or args.target_param_data_ratio > 0 or args.target_flops > 0
+# Number of iterations + schedulers
 if args.num_iterations > 0:
-    # Override num_iterations to a specific value if given
     num_iterations = args.num_iterations
     print0(f"Using user-provided number of iterations: {num_iterations:,}")
-# elif args.target_flops > 0:
-#     # Calculate the number of iterations from the target flops (used in scaling laws analysis, e.g. runs/scaling_laws.sh)
-#     num_iterations = round(args.target_flops / (num_flops_per_token * total_batch_size))
-#     print0(f"Calculated number of iterations from target FLOPs: {num_iterations:,}")
 elif args.target_param_data_ratio > 0:
-    # Calculate the number of iterations from the target param data ratio (the most common use case)
     num_iterations = target_tokens // total_batch_size
     print0(f"Calculated number of iterations from target data:param ratio: {num_iterations:,}")
 else:
     raise ValueError("No training horizon specified")
 
-
-total_tokens = total_batch_size * num_iterations # the actual number of tokens we will train for
+total_tokens = total_batch_size * num_iterations
 print0(f"Total number of training tokens: {total_tokens:,}")
 
-# --end-step only controls where THIS session stops; the LR schedule / horizon still uses num_iterations.
 end_step = args.end_step
 if end_step is not None and end_step > 0:
     if end_step >= num_iterations:
-        print0(f"[end-step] Requested end_step={end_step} >= num_iterations={num_iterations}; ignoring (will train to the full horizon).")
+        print0(f"[end-step] Requested end_step={end_step} >= num_iterations={num_iterations}; ignoring.")
         end_step = -1
     elif resuming and meta_data is not None and end_step <= int(meta_data["step"]):
         raise ValueError(f"[end-step] end_step={end_step} must be greater than the resume step ({int(meta_data['step'])}).")
     else:
-        print0(f"[end-step] This session will stop at step {end_step} (full horizon is {num_iterations}). Resume later with --resume-from-step={end_step}.")
-# print0(f"Tokens : Scaling params ratio: {total_batch_size * num_iterations / num_scaling_params:.2f}") # e.g. Chinchilla was ~20
-# print0(f"Total training FLOPs estimate: {num_flops_per_token * total_tokens:e}")
+        print0(f"[end-step] This session will stop at step {end_step} (full horizon is {num_iterations}).")
 
-# Learning rate schedule (linear warmup, constant, linear/cosine warmdown)
+
 def get_lr_multiplier(it):
     warmup_iters = round(args.warmup_ratio * num_iterations)
     warmdown_iters = round(args.warmdown_ratio * num_iterations)
-    # 1) warmup: linear ramp from 0 to 1
     if it < warmup_iters:
         return (it + 1) / warmup_iters
-    # 3) warmdown: linear or cosine decay to final_lr_frac
     else:
-        progress = 1.0-(it-warmup_iters) / (num_iterations-warmup_iters)  #  1.0 -> 0.0
+        progress = 1.0 - (it - warmup_iters) / (num_iterations - warmup_iters)
         if args.lr_schedule == "cosine":
-            # cosine annealing: smooth decay, never fully zero until the end
-            decay = (1 + math.cos(math.pi * (1.0-progress))) / 2  # 1.0 -> 0.0
+            decay = (1 + math.cos(math.pi * (1.0 - progress))) / 2
             return args.final_lr_frac + (1.0 - args.final_lr_frac) * decay
         elif args.lr_schedule == "linear":
-            # linear decay (default)
             decay = progress
             return args.final_lr_frac + (1.0 - args.final_lr_frac) * decay
         else:
@@ -769,27 +596,22 @@ def get_lr_multiplier(it):
             return progress * 1.0 + (1 - progress) * args.final_lr_frac
 
 
-
-# Momentum scheduler for Muon optimizer (warms up to 0.95 over the first 300 steps)
 def get_muon_momentum(it):
     frac = min(it / 300, 1)
-    momentum = (1 - frac) * 0.85 + frac * 0.95
-    return momentum
+    return (1 - frac) * 0.85 + frac * 0.95
 
-# Weight decay scheduler for Muon optimizer (linearly decays to zero over the course of training)
+
 def get_weight_decay(it):
     return weight_decay_scaled * (1 - it / num_iterations)
 
 # -----------------------------------------------------------------------------
 # Training loop
-
-# Loop state (variables updated by the training loop)
 if not resuming:
     step = 0
-    val_bpb = None # will be set if eval_every > 0
+    val_bpb = None
     min_val_bpb = float("inf")
-    smooth_train_loss = 0 # EMA of training loss
-    total_training_time = 0 # total wall-clock time of training
+    smooth_train_loss = 0
+    total_training_time = 0
 else:
     step = meta_data["step"]
     loop_state = meta_data["loop_state"]
@@ -798,55 +620,27 @@ else:
     smooth_train_loss = loop_state["smooth_train_loss"]
     total_training_time = loop_state["total_training_time"]
 
-# Figure out the needed gradient accumulation micro-steps to reach the desired total batch size per step
-tokens_per_fwdbwd = args.device_batch_size * args.max_seq_len # tokens per iteration for a single rank
-world_tokens_per_fwdbwd = tokens_per_fwdbwd * ddp_world_size # total tokens per iteration for all ranks
+tokens_per_fwdbwd = args.device_batch_size * args.max_seq_len
+world_tokens_per_fwdbwd = tokens_per_fwdbwd * ddp_world_size
 assert total_batch_size % world_tokens_per_fwdbwd == 0
 grad_accum_steps = total_batch_size // world_tokens_per_fwdbwd
 print0(f"Tokens / micro-batch / rank: {args.device_batch_size} x {args.max_seq_len} = {tokens_per_fwdbwd:,}")
 print0(f"Tokens / micro-batch: {world_tokens_per_fwdbwd:,}")
 print0(f"Total batch size {total_batch_size:,} => gradient accumulation steps: {grad_accum_steps}")
 
-# Go!
 while True:
-    last_step = step == num_iterations # loop runs num_iterations+1 times so that we can eval/save at the end
-    # If --end-step is set, stop THIS session early at end_step (eval/save at that step, then break).
-    # The LR schedule is unaffected (still based on num_iterations), so this is a pause, not the final horizon.
+    last_step = step == num_iterations
     session_end = end_step > 0 and step == end_step
     if session_end:
         last_step = True
-    # flops_so_far = num_flops_per_token * total_batch_size * step
     flops_so_far = 0
-    #
-    # # once in a while: evaluate the val bpb (all ranks participate)
-    # if args.eval_every > 0 and (last_step or step % args.eval_every == 0):
-    #     model.eval()
-    #     val_loader = build_val_loader()
-    #     eval_steps = args.eval_tokens // (args.device_batch_size * args.max_seq_len * ddp_world_size)
-    #     with disable_fp8(model), autocast_ctx:
-    #         val_bpb = evaluate_bpb(model, val_loader, eval_steps, token_bytes)
-    #     print0(f"Step {step:05d} | Validation bpb: {val_bpb:.6f}")
-    #     if val_bpb < min_val_bpb:
-    #         min_val_bpb = val_bpb
-    #     wandb_run.log({
-    #         "step": step,
-    #         "total_training_flops": flops_so_far,
-    #         "total_training_time": total_training_time,
-    #         "val/bpb": val_bpb,
-    #     })
-    #     model.train()
 
-    # once in a while: estimate the CORE metric (all ranks participate)
-    # use the original uncompiled model because the inputs keep changing shape
-    # disable FP8 for evaluation to use BF16 for more consistent/accurate results
     results = {}
-    # Note: skip the resume step itself (step == resume_from_step) so we don't immediately eval right
-    # after resuming (e.g. resume from 5000 shouldn't trigger CORE eval at step 5000).
     if args.core_metric_every > 0 and (last_step or (step > 0 and step != args.resume_from_step and step % args.core_metric_every == 0)):
         model.eval()
         ema_ctx = apply_ema_weights(orig_model, ema_state) if (args.ema_eval and ema_state is not None) else nullcontext()
         with ema_ctx:
-            with disable_fp8(orig_model), autocast_ctx:
+            with autocast_ctx:
                 results = evaluate_core(orig_model, tokenizer, device, max_per_task=args.core_metric_max_per_task)
         print0(f"Step {step:05d} | CORE metric: {results['core_metric']:.4f}")
         wandb_run.log({
@@ -857,9 +651,6 @@ while True:
         })
         model.train()
 
-    # once in a while: sample from the model (only on master process)
-    # use the original uncompiled model because the inputs keep changing shape
-    # (also skip the resume step itself, same as CORE eval above)
     if args.sample_every > 0 and master_process and (last_step or (step > 0 and step != args.resume_from_step and step % args.sample_every == 0)):
         model.eval()
         prompts = [
@@ -871,28 +662,26 @@ while True:
             "My favorite color is",
             "If 5*x + 3 = 13, then x is",
         ]
-        engine = Engine(orig_model, tokenizer) # use orig_model to avoid recompilation
+        engine = Engine(orig_model, tokenizer)
         ema_ctx = apply_ema_weights(orig_model, ema_state) if (args.ema_eval and ema_state is not None) else nullcontext()
         with ema_ctx:
             for prompt in prompts:
                 tokens = tokenizer(prompt, prepend="<|bos|>")
-                with disable_fp8(orig_model), autocast_ctx:
+                with autocast_ctx:
                     sample, _ = engine.generate_batch(tokens, num_samples=1, max_tokens=16, temperature=0)
                 print0(tokenizer.decode(sample[0]))
         model.train()
 
-    # save checkpoint: at the end of the run, or every save_every steps, except at the first step or the resume step
     if last_step or (step > 0 and step != args.resume_from_step and args.save_every > 0 and step % args.save_every == 0):
-        meta_dict = { # metadata saved as json
+        meta_dict = {
             "step": step,
-            "val_bpb": val_bpb, # loss at last step
-            # "model_config": model_config_kwargs,
-            "user_config": user_config, # inputs to the training script
+            "val_bpb": val_bpb,
+            "user_config": user_config,
             "device_batch_size": args.device_batch_size,
             "max_seq_len": args.max_seq_len,
             "total_batch_size": total_batch_size,
             "dataloader_state_dict": dataloader_state_dict,
-            "loop_state": { # all loop state (other than step) so that we can resume training
+            "loop_state": {
                 "min_val_bpb": min_val_bpb,
                 "smooth_train_loss": smooth_train_loss,
                 "total_training_time": total_training_time,
@@ -901,19 +690,14 @@ while True:
         save_pt = args.save_format in ("pt", "both")
         save_hf = args.save_format in ("hf", "both")
 
-        # Build the optimizer/loop state whenever we save (pt or hf) so both formats can be resumed.
         model_state_for_save = None
         optimizer_state = None
         if save_pt or save_hf:
             if args.ema_eval and ema_state is not None:
                 with apply_ema_weights(orig_model, ema_state):
-                    model_state_for_save = {
-                        k: v.detach().clone()
-                        for k, v in orig_model.state_dict().items()
-                    }
+                    model_state_for_save = {k: v.detach().clone() for k, v in orig_model.state_dict().items()}
             else:
                 model_state_for_save = orig_model.state_dict()
-
             optimizer_state = {
                 "adamw": optimizer.state_dict(),
                 "muon": muon_optimizer.state_dict() if muon_optimizer is not None else None,
@@ -924,71 +708,39 @@ while True:
 
         if save_pt:
             if ddp:
-                # Save sequentially across ranks to avoid concurrent heavy writes to the same filesystem.
                 for save_rank in range(ddp_world_size):
                     if ddp_rank == save_rank:
-                        save_checkpoint(
-                            checkpoint_dir,
-                            step,
-                            model_state_for_save, # model parameters
-                            optimizer_state, # optimizer state(s), saved via torch.save
-                            meta_dict,
-                            rank=ddp_rank,
-                        )
+                        save_checkpoint(checkpoint_dir, step, model_state_for_save, optimizer_state, meta_dict, rank=ddp_rank)
                     torch.distributed.barrier()
             else:
-                save_checkpoint(
-                    checkpoint_dir,
-                    step,
-                    model_state_for_save, # model parameters
-                    optimizer_state, # optimizer state(s), saved via torch.save
-                    meta_dict,
-                    rank=ddp_rank,
-                )
+                save_checkpoint(checkpoint_dir, step, model_state_for_save, optimizer_state, meta_dict, rank=ddp_rank)
 
-        # Also export a transformers-compatible checkpoint (config.json + safetensors + tokenizer).
-        # We additionally save the optimizer/loop state (optim.pt + meta.json) inside the hf dir so
-        # training can also be resumed from an HF checkpoint via --resume-from-step.
-        # Note: under DDP the optimizer state is replicated across ranks, so saving the master's
-        # single shard is sufficient for resume (load falls back to it for all ranks).
         if save_hf:
             if master_process:
                 hf_dir = os.path.join(checkpoint_dir, f"hf_{step:06d}")
                 ema_ctx = apply_ema_weights(orig_model, ema_state) if (args.ema_eval and ema_state is not None) else nullcontext()
                 with ema_ctx:
-                    save_hf_checkpoint(
-                        hf_dir,
-                        orig_model,
-                        tokenizer=tokenizer,
-                        optimizer_data=optimizer_state,
-                        meta_data=meta_dict,
-                    )
+                    save_hf_checkpoint(hf_dir, orig_model, tokenizer=tokenizer, optimizer_data=optimizer_state, meta_data=meta_dict)
             if ddp:
                 torch.distributed.barrier()
 
-    # termination conditions (TODO: possibly also add loss explosions etc.)
     if last_step:
         break
 
     # -------------------------------------------------------------------------
     # single training step
-    # evaluate the gradient
     synchronize()
     t0 = time.time()
 
     for micro_step in range(grad_accum_steps):
-        # Under DDP with gradient accumulation, only synchronize (all-reduce) gradients on the
-        # final micro-step. no_sync() skips the all-reduce on the intermediate micro-steps; the
-        # final backward then reduces the fully-accumulated gradient -> 1 comm per optimizer step.
         is_last_micro = micro_step == grad_accum_steps - 1
         sync_ctx = model.no_sync() if (ddp and not is_last_micro) else nullcontext()
         with sync_ctx:
             with autocast_ctx:
                 loss = model(x, y)
-            train_loss = loss.detach() # for logging
-            loss = loss / grad_accum_steps # each .backward() is a grad sum => normalize loss here
+            train_loss = loss.detach()
+            loss = loss / grad_accum_steps
             loss.backward()
-        # DFLASH draft loss: predict masked blocks from detached target hidden states (online)
         if draft_model is not None:
             draft_sync = draft_model.no_sync() if (ddp and not is_last_micro) else nullcontext()
             with draft_sync:
@@ -997,21 +749,19 @@ while True:
                     T = x.shape[1]
                     bsz = x.shape[0]
                     nb = args.dflash_num_blocks
-                    # need a clean anchor + (B-1) future tokens, so anchor in [0, T-B)
                     if T - B > 0 and nb >= 1:
                         if args.dflash_grad_to_target:
                             all_hidden = orig_model.all_hidden_states_with_grad(x)
                         else:
                             all_hidden = orig_model.get_all_hidden_states(x)
-                        feat = extract_context_feature(all_hidden, draft_layer_ids)  # [bsz, T, H*L]
-                        # randomly sample nb anchor positions per sequence (block = anchor..anchor+B-1)
-                        anchors = torch.randint(0, T - B, (bsz, nb), device=device)  # [bsz, nb]
+                        feat = extract_context_feature(all_hidden, draft_layer_ids)
+                        anchors = torch.randint(0, T - B, (bsz, nb), device=device)
                         rng = torch.arange(B, device=device)
-                        idx = anchors[:, :, None] + rng[None, None, :]  # [bsz, nb, B]
+                        idx = anchors[:, :, None] + rng[None, None, :]
                         bf = idx.reshape(bsz, nb * B)
                         ctx = torch.gather(feat, 1, bf[:, :, None].expand(-1, -1, feat.shape[-1])).reshape(bsz * nb, B, feat.shape[-1])
                         blk = torch.gather(x, 1, bf).reshape(bsz, nb, B).clone()
-                        blk[:, :, 1:] = dflash_mask_token_id  # keep clean anchor, mask the rest
+                        blk[:, :, 1:] = dflash_mask_token_id
                         blk = blk.reshape(bsz * nb, B)
                         emb = orig_model.model.embed_tokens(blk)
                         noise_emb = emb if args.dflash_grad_to_target else emb.detach()
@@ -1019,18 +769,17 @@ while True:
                         h = draft_model(target_hidden=ctx, noise_embedding=noise_emb, position_ids=pos, use_cache=False, is_causal=False)
                         lm_w = orig_model.lm_head.weight if args.dflash_grad_to_target else orig_model.lm_head.weight.detach()
                         draft_logits = F.linear(h, lm_w).float()
-                        labels = torch.gather(y, 1, bf).reshape(bsz * nb, B)  # next-token targets per position
+                        labels = torch.gather(y, 1, bf).reshape(bsz * nb, B)
                         per_tok = F.cross_entropy(draft_logits.reshape(-1, draft_logits.size(-1)), labels.reshape(-1), reduction="none").reshape(bsz * nb, B)
-                        wk = torch.exp(-rng.float() / max(1e-6, args.dflash_gamma))  # [B], emphasize early positions
+                        wk = torch.exp(-rng.float() / max(1e-6, args.dflash_gamma))
                         draft_loss = (per_tok * wk[None, :]).sum() / (per_tok.shape[0] * wk.sum())
                         (args.dflash_weight * draft_loss / grad_accum_steps).backward()
-        x, y, dataloader_state_dict = next(train_loader) # prefetch the next batch while the GPU is busy with forward/backward
-    # step the optimizer
+        x, y, dataloader_state_dict = next(train_loader)
+
     lrm = get_lr_multiplier(step)
     for group in optimizer.param_groups:
         group["lr"] = group["initial_lr"] * lrm
 
-    # Update muon_optimizer parameters if it exists
     if muon_optimizer is not None:
         muon_momentum = get_muon_momentum(step)
         muon_weight_decay = get_weight_decay(step)
@@ -1039,8 +788,8 @@ while True:
             group["weight_decay"] = muon_weight_decay
             group["lr"] = group["initial_lr"] * lrm
 
-    if args.grad_max_norm>0:
-        grad_norm = torch.nn.utils.clip_grad_norm_(model.parameters(), max_norm=args.grad_max_norm)
+    if args.grad_max_norm > 0:
+        torch.nn.utils.clip_grad_norm_(model.parameters(), max_norm=args.grad_max_norm)
     optimizer.step()
     if muon_optimizer is not None:
         muon_optimizer.step()
@@ -1054,98 +803,79 @@ while True:
     model.zero_grad(set_to_none=True)
     if ema_state is not None:
         update_ema_state(orig_model, ema_state, args.ema_decay)
-    train_loss_f = train_loss.item() # .item() is a CPU-GPU sync point
+    train_loss_f = train_loss.item()
     synchronize()
     t1 = time.time()
     dt = t1 - t0
-    # -------------------------------------------------------------------------
 
-    # logging (CPU action only)
-    ema_beta = 0.9 # EMA decay factor for some smoothing just for nicer logging
-    smooth_train_loss = ema_beta * smooth_train_loss + (1 - ema_beta) * train_loss_f # EMA the training loss
-    debiased_smooth_loss = smooth_train_loss / (1 - ema_beta**(step + 1)) # debias the EMA
+    ema_beta = 0.9
+    smooth_train_loss = ema_beta * smooth_train_loss + (1 - ema_beta) * train_loss_f
+    debiased_smooth_loss = smooth_train_loss / (1 - ema_beta ** (step + 1))
     pct_done = 100 * step / num_iterations
     tok_per_sec = int(total_batch_size / dt)
-    # flops_per_sec = num_flops_per_token * total_batch_size / dt
-    # mfu = 100 * flops_per_sec / (gpu_peak_flops * ddp_world_size)
-    flops_per_sec = 0.0 #TODO hard coded
-    mfu  = 0.0 # TODO hard coded
-    num_params = 1
-    num_flops_per_token = 1
+    mfu = 0.0
 
     if step > 10:
-        total_training_time += dt # only count the time after the first 10 steps
-    # Calculate ETA based on average time per step (excluding first 10 steps)
+        total_training_time += dt
     steps_done = step - 10
     if steps_done > 0:
         avg_time_per_step = total_training_time / steps_done
-        remaining_steps = num_iterations - step
-        eta_seconds = remaining_steps * avg_time_per_step
+        eta_seconds = (num_iterations - step) * avg_time_per_step
         eta_str = f" | eta: {eta_seconds/60:.1f}m"
     else:
         eta_str = ""
     epoch = dataloader_state_dict["epoch"]
     print0(f"step {step:05d}/{num_iterations:05d} ({pct_done:.2f}%) | loss: {debiased_smooth_loss:.6f} | lrm: {lrm:.2f} | dt: {dt * 1000:.2f}ms | tok/sec: {tok_per_sec:,} | bf16_mfu: {mfu:.2f} | epoch: {epoch} | total time: {total_training_time/60:.2f}m{eta_str}")
     if step % 100 == 0:
-        log_data = {
+        wandb_run.log({
             "step": step,
             "total_training_flops": flops_so_far,
             "total_training_time": total_training_time,
             "train/loss": debiased_smooth_loss,
-            "train/lrm": lr*lrm,
+            "train/lrm": lr * lrm,
             "train/dt": dt,
             "train/tok_per_sec": tok_per_sec,
             "train/mfu": mfu,
             "train/epoch": epoch,
-        }
-        wandb_run.log(log_data)
+        })
 
-    # state update
     first_step_of_run = (step == 0) or (resuming and step == args.resume_from_step)
     step += 1
 
-    # The garbage collector is sadly a little bit overactive and for some poorly understood reason,
-    # it spends ~500ms scanning for cycles quite frequently, just to end up cleaning up very few tiny objects each time.
-    # So we manually manage and help it out here
     if first_step_of_run:
-        gc.collect() # manually collect a lot of garbage from setup
-        gc.freeze() # immediately freeze all currently surviving objects and exclude them from GC
-        gc.disable() # nuclear intervention here: disable GC entirely except:
-    elif step % 5000 == 0: # every 5000 steps...
-        gc.collect() # manually collect, just to be safe for very, very long runs
+        gc.collect()
+        gc.freeze()
+        gc.disable()
+    elif step % 5000 == 0:
+        gc.collect()
 
-# print a few more stats
 print0(f"Peak memory usage: {get_max_memory() / 1024 / 1024:.2f}MiB")
 print0(f"Total training time: {total_training_time/60:.2f}m")
 if val_bpb is not None:
     print0(f"Minimum validation bpb: {min_val_bpb:.6f}")
 
-# Log to report
 from nanochat.report import get_report
-get_report().log(section="Base model training", data=[
-    user_config, # CLI args
-    { # stats about the training setup
+get_report().log(section="Qwen3.5 base model training", data=[
+    user_config,
+    {
         "Number of parameters": num_params,
-        "Number of FLOPs per token": f"{num_flops_per_token:e}",
         "Calculated number of iterations": num_iterations,
         "Number of training tokens": total_tokens,
-        # "Tokens : Scaling params ratio": total_batch_size * num_iterations / num_scaling_params,
         "DDP world size": ddp_world_size,
         "warmup_ratio": args.warmup_ratio,
         "warmdown_ratio": args.warmdown_ratio,
         "final_lr_frac": args.final_lr_frac,
+        "layer_types": model_config.layer_types,
     },
-    { # stats about training outcomes
+    {
         "Minimum validation bpb": min_val_bpb if val_bpb is not None else None,
         "Final validation bpb": val_bpb,
         "CORE metric estimate": results.get("core_metric", None),
-        "MFU %": f"{mfu:.2f}%",
-        "Total training flops": f"{flops_so_far:e}",
         "Total training time": f"{total_training_time/60:.2f}m",
         "Peak memory usage": f"{get_max_memory() / 1024 / 1024:.2f}MiB",
     }
 ])
 
-# cleanup
-wandb_run.finish() # wandb run finish
+wandb_run.finish()
 compute_cleanup()
+

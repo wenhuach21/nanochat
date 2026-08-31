@@ -156,9 +156,64 @@ class HuggingFaceTokenizer:
 
 # -----------------------------------------------------------------------------
 # Tokenizer based on rustbpe + tiktoken combo
+import json
 import pickle
 import rustbpe
 import tiktoken
+
+
+# ---- Helpers to convert a tiktoken encoding into a HuggingFace `tokenizers` BPE ----
+# (needed so we can export a transformers-compatible tokenizer.json)
+
+def _bytes_to_unicode():
+    """GPT-2/ByteLevel reversible byte<->unicode mapping (same as tokenizers.ByteLevel)."""
+    bs = (
+        list(range(ord("!"), ord("~") + 1))
+        + list(range(ord("¡"), ord("¬") + 1))
+        + list(range(ord("®"), ord("ÿ") + 1))
+    )
+    cs = bs[:]
+    n = 0
+    for b in range(256):
+        if b not in bs:
+            bs.append(b)
+            cs.append(256 + n)
+            n += 1
+    return dict(zip(bs, (chr(c) for c in cs)))
+
+
+def _token_bytes_to_string(token_bytes, byte_encoder):
+    return "".join(byte_encoder[b] for b in token_bytes)
+
+
+def _bpe_split(mergeable_ranks, token, max_rank):
+    """Re-run BPE on a single token to find the two parts it was merged from."""
+    parts = [bytes([b]) for b in token]
+    while True:
+        min_idx, min_rank = None, None
+        for i in range(len(parts) - 1):
+            rank = mergeable_ranks.get(parts[i] + parts[i + 1])
+            if rank is not None and (min_rank is None or rank < min_rank):
+                min_idx, min_rank = i, rank
+        if min_rank is None or (max_rank is not None and min_rank >= max_rank):
+            break
+        parts = parts[:min_idx] + [parts[min_idx] + parts[min_idx + 1]] + parts[min_idx + 2:]
+    return parts
+
+
+def _recover_merges(mergeable_ranks):
+    """Recover the ordered BPE merge rules from tiktoken's mergeable_ranks."""
+    merges = {}
+    for token, rank in mergeable_ranks.items():
+        if len(token) == 1:
+            continue
+        pair = _bpe_split(mergeable_ranks, token, max_rank=rank)
+        if len(pair) != 2:
+            continue
+        ix0 = mergeable_ranks[pair[0]]
+        ix1 = mergeable_ranks[pair[1]]
+        merges[(ix0, ix1)] = rank
+    return merges
 
 class RustBPETokenizer:
     """Light wrapper around tiktoken (for efficient inference) but train with rustbpe"""
@@ -262,6 +317,127 @@ class RustBPETokenizer:
         with open(pickle_path, "wb") as f:
             pickle.dump(self.enc, f)
         print(f"Saved tokenizer encoding to {pickle_path}")
+
+    def save_pretrained(self, save_dir, verify=True):
+        """Export a transformers-compatible tokenizer (loadable via AutoTokenizer.from_pretrained).
+
+        Writes tokenizer.json (HuggingFace `tokenizers` fast format), tokenizer_config.json and
+        special_tokens_map.json. Internally converts the tiktoken BPE (mergeable_ranks) into an
+        equivalent ByteLevel BPE with the same split pattern used at training time.
+
+        If `verify` is True, the exported tokenizer is reloaded and its encodings are compared
+        against this tokenizer on a few sample strings; a mismatch raises AssertionError. This
+        guards against subtle bugs in the BPE merge recovery. If transformers isn't installed,
+        verification is skipped with a warning.
+        """
+        os.makedirs(save_dir, exist_ok=True)
+
+        mergeable_ranks = self.enc._mergeable_ranks  # dict[bytes, int]
+        special_tokens = self.enc._special_tokens    # dict[str, int]
+
+        byte_encoder = _bytes_to_unicode()
+        id_to_bytes = {v: k for k, v in mergeable_ranks.items()}
+
+        # 1) Build the vocab in ByteLevel-unicode space
+        vocab = {_token_bytes_to_string(b, byte_encoder): i for b, i in mergeable_ranks.items()}
+        # 2) Recover the ordered merge rules
+        merges_dict = _recover_merges(mergeable_ranks)
+        merges = []
+        for (ix0, ix1), _rank in sorted(merges_dict.items(), key=lambda kv: kv[1]):
+            s0 = _token_bytes_to_string(id_to_bytes[ix0], byte_encoder)
+            s1 = _token_bytes_to_string(id_to_bytes[ix1], byte_encoder)
+            merges.append((s0, s1))
+
+        # 3) Assemble the fast tokenizer with the same pre-tokenizer/decoder as training
+        hf_tokenizer = HFTokenizer(BPE(vocab=vocab, merges=merges, fuse_unk=False, byte_fallback=False))
+        gpt4_split_regex = Regex(SPLIT_PATTERN)
+        hf_tokenizer.pre_tokenizer = pre_tokenizers.Sequence([
+            pre_tokenizers.Split(pattern=gpt4_split_regex, behavior="isolated", invert=False),
+            pre_tokenizers.ByteLevel(add_prefix_space=False, use_regex=False),
+        ])
+        hf_tokenizer.decoder = decoders.ByteLevel()
+        # add special tokens in ascending id order so their ids match the tiktoken ids
+        specials_sorted = [name for name, _id in sorted(special_tokens.items(), key=lambda kv: kv[1])]
+        hf_tokenizer.add_special_tokens(specials_sorted)
+
+        tokenizer_path = os.path.join(save_dir, "tokenizer.json")
+        hf_tokenizer.save(tokenizer_path)
+
+        # 4) Determine BOS token name (nanochat uses <|bos|>, GPT-2 style uses <|endoftext|>)
+        bos_token = None
+        for cand in ("<|bos|>", "<|endoftext|>"):
+            if cand in special_tokens:
+                bos_token = cand
+                break
+
+        # 5) transformers metadata files
+        special_tokens_map = {"additional_special_tokens": specials_sorted}
+        if bos_token is not None:
+            special_tokens_map["bos_token"] = bos_token
+        with open(os.path.join(save_dir, "special_tokens_map.json"), "w", encoding="utf-8") as f:
+            json.dump(special_tokens_map, f, indent=2, ensure_ascii=False)
+
+        # chat template mirroring RustBPETokenizer.render_conversation (user/assistant turns)
+        chat_template = (
+            "{{ '<|bos|>' }}"
+            "{% for message in messages %}"
+            "{% if message['role'] == 'user' %}"
+            "{{ '<|user_start|>' + message['content'] + '<|user_end|>' }}"
+            "{% elif message['role'] == 'assistant' %}"
+            "{{ '<|assistant_start|>' + message['content'] + '<|assistant_end|>' }}"
+            "{% endif %}"
+            "{% endfor %}"
+            "{% if add_generation_prompt %}{{ '<|assistant_start|>' }}{% endif %}"
+        )
+        tokenizer_config = {
+            "tokenizer_class": "PreTrainedTokenizerFast",
+            "clean_up_tokenization_spaces": False,
+            "model_max_length": int(1e30),
+            "additional_special_tokens": specials_sorted,
+            "chat_template": chat_template,
+        }
+        if bos_token is not None:
+            tokenizer_config["bos_token"] = bos_token
+        with open(os.path.join(save_dir, "tokenizer_config.json"), "w", encoding="utf-8") as f:
+            json.dump(tokenizer_config, f, indent=2, ensure_ascii=False)
+
+        print(f"Saved transformers-compatible tokenizer to {save_dir}")
+
+        if verify:
+            self._verify_pretrained(save_dir)
+
+    def _verify_pretrained(self, save_dir):
+        """Reload the exported tokenizer and assert it encodes identically to this one."""
+        try:
+            from transformers import PreTrainedTokenizerFast
+        except ImportError:
+            print("[save_pretrained] transformers not installed; skipping verification.")
+            return
+        hf = PreTrainedTokenizerFast(tokenizer_file=os.path.join(save_dir, "tokenizer.json"))
+        # Note: avoid strings that literally contain special tokens (e.g. "<|bos|>"), since the
+        # fast tokenizer would split them out as special tokens while encode_ordinary would not.
+        samples = [
+            "Hello world! The capital of France is Paris.",
+            "If 5*x + 3 = 13, then x is 2.",
+            "def add(a, b):\n    return a + b  # sum 123 + 456",
+            "Numbers 007 42 100 and symbols @#$%^&*()",
+            "  leading spaces\tand\ttabs\nand newlines\n\n",
+            "Café naïve résumé — Ünïcödé 你好，世界 🚀",
+            "CamelCaseAndsnake_case_MixED 3.14159",
+        ]
+        mismatches = []
+        for text in samples:
+            expected = self.encode(text)
+            got = hf.encode(text, add_special_tokens=False)
+            if expected != got:
+                mismatches.append((text, expected, got))
+        if mismatches:
+            lines = [f"  {text!r}\n    expected={exp}\n    got     ={got}" for text, exp, got in mismatches]
+            raise AssertionError(
+                "Exported tokenizer does not match the original on "
+                f"{len(mismatches)}/{len(samples)} samples:\n" + "\n".join(lines)
+            )
+        print(f"[save_pretrained] Verified {len(samples)} samples encode identically ✓")
 
     def render_conversation(self, conversation, max_tokens=2048):
         """
@@ -387,20 +563,64 @@ class RustBPETokenizer:
 # -----------------------------------------------------------------------------
 # nanochat-specific convenience functions
 
-def get_tokenizer():
-    from nanochat.common import get_base_dir
-    base_dir = get_base_dir()
-    tokenizer_dir = os.path.join(base_dir, "tokenizer")
-    # return HuggingFaceTokenizer.from_directory(tokenizer_dir)
-    return RustBPETokenizer.from_directory(tokenizer_dir)
+# Directory names (under get_base_dir()) for each tokenizer backend.
+TOKENIZER_DIRS = {
+    "rustbpe": "tokenizer",              # trained by scripts/tok_train.py (RustBPE + tiktoken)
+    "transformers": "tokenizer_transformers",  # transformers PreTrainedTokenizerFast
+}
 
-def get_token_bytes(device="cpu"):
-    import torch
+def get_tokenizer_dir(backend="rustbpe"):
+    """Return the on-disk directory for a given tokenizer backend."""
     from nanochat.common import get_base_dir
-    base_dir = get_base_dir()
-    tokenizer_dir = os.path.join(base_dir, "tokenizer")
+    assert backend in TOKENIZER_DIRS, f"Unknown tokenizer backend: {backend} (choices: {list(TOKENIZER_DIRS)})"
+    return os.path.join(get_base_dir(), TOKENIZER_DIRS[backend])
+
+def get_tokenizer(backend="rustbpe"):
+    """
+    Load a tokenizer by backend:
+    - "rustbpe":      the RustBPE/tiktoken tokenizer trained by scripts/tok_train.py
+    - "transformers": a transformers PreTrainedTokenizerFast (nanochat.tokenizer_transformers)
+    Both expose the same nanochat interface (encode/decode/get_bos_token_id/...).
+    """
+    tokenizer_dir = get_tokenizer_dir(backend)
+    if backend == "rustbpe":
+        return RustBPETokenizer.from_directory(tokenizer_dir)
+    elif backend == "transformers":
+        # imported lazily so that rustbpe-only workflows don't require transformers
+        from nanochat.tokenizer_transformers import TransformersTokenizer
+        return TransformersTokenizer.from_directory(tokenizer_dir)
+    else:
+        raise ValueError(f"Unknown tokenizer backend: {backend}")
+
+def compute_token_bytes(tokenizer, device="cpu"):
+    """
+    Compute the (vocab_size,) int32 tensor of per-token byte lengths for ANY tokenizer
+    that exposes get_vocab_size()/get_special_tokens()/decode(). Special tokens get 0 bytes
+    (excluded from the bits-per-byte metric). Mirrors the logic in scripts/tok_train.py so
+    that bpb can be evaluated for tokenizers that don't ship a cached token_bytes.pt.
+    """
+    import torch
+    vocab_size = tokenizer.get_vocab_size()
+    special_set = set(tokenizer.get_special_tokens())
+    token_bytes = []
+    for token_id in range(vocab_size):
+        token_str = tokenizer.decode([token_id])
+        if token_str in special_set:
+            token_bytes.append(0)
+        else:
+            token_bytes.append(len(token_str.encode("utf-8")))
+    return torch.tensor(token_bytes, dtype=torch.int32, device=device)
+
+def get_token_bytes(device="cpu", backend="rustbpe"):
+    import torch
+    tokenizer_dir = get_tokenizer_dir(backend)
     token_bytes_path = os.path.join(tokenizer_dir, "token_bytes.pt")
-    assert os.path.exists(token_bytes_path), f"Token bytes not found at {token_bytes_path}? It gets written by tok_train.py"
-    with open(token_bytes_path, "rb") as f:
-        token_bytes = torch.load(f, map_location=device)
-    return token_bytes
+    if os.path.exists(token_bytes_path):
+        with open(token_bytes_path, "rb") as f:
+            token_bytes = torch.load(f, map_location=device)
+        return token_bytes
+    # No cached file (e.g. transformers backend): compute on the fly from the tokenizer.
+    if backend == "rustbpe":
+        raise AssertionError(f"Token bytes not found at {token_bytes_path}? It gets written by tok_train.py")
+    tokenizer = get_tokenizer(backend)
+    return compute_token_bytes(tokenizer, device=device)

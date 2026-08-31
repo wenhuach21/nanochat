@@ -78,3 +78,11 @@ adam
 
 run_datetime_bj,git_commit,depth,lr,weight_decay,warmup_ratio,hidden_size,embedding_lr,target_param_data_ratio,grad_max_norm,params_total,num_iterations,tokens_trained,final_loss,val_bpb,core_score,train_time_sec
 2026-08-04 14:23:46,unknown,28,0.003,0.02,0.0,1024,0.3,100,-1.0,0,85612,44885344256,2.443012,,0.261,638582
+
+
+
+1p7
+
+
+run_datetime_bj,git_commit,depth,lr,weight_decay,warmup_ratio,hidden_size,head_dim,num_kv_heads,embedding_lr,target_param_data_ratio,grad_max_norm,params_total,num_iterations,tokens_trained,final_loss,val_bpb,core_score,train_time_sec
+2026-08-19 14:04:55,d8a37842b7b5252db1b5dd6bf510068f9858397f,28,0.003,0.02,0.0,2048,128,8,0.3,100,-1.0,0,147211,77180960768,2.189171,,0.3607,1000807

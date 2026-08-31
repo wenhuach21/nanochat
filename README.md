@@ -93,6 +93,7 @@ I've published a number of guides that might contain helpful information, most r
 - To add new abilities to nanochat, see [Guide: counting r in strawberry (and how to add abilities generally)](https://github.com/karpathy/nanochat/discussions/164).
 - To customize your nanochat, see [Guide: infusing identity to your nanochat](https://github.com/karpathy/nanochat/discussions/139) in Discussions, which describes how you can tune your nanochat's personality through synthetic data generation and mixing that data into the SFT stage.
 - [Oct 13 2025: original nanochat post](https://github.com/karpathy/nanochat/discussions/1) introducing nanochat, though now it contains some deprecated information and the model is a lot older (with worse results) than current master.
+- [docs/train_transformers_tokenizer.md](docs/train_transformers_tokenizer.md): how to train a `transformers`-compatible tokenizer (loadable via `AutoTokenizer.from_pretrained`) in a conda environment.
 
 ## File structure
 

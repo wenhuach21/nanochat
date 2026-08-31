@@ -84,6 +84,36 @@ def _adjust_lr(lr: float, adjust_lr_fn: str | None, param_shape: torch.Size) -> 
     return lr * adjusted_ratio
 
 
+def _orthogonalize_maybe_per_head(
+    update: Tensor,
+    ns_coefficients: tuple[float, float, float],
+    ns_steps: int,
+    eps: float,
+    num_split: int,
+    split_dim: int,
+) -> Tensor:
+    """Orthogonalize `update`, optionally per attention head (Kimi-K3 style).
+
+    Fused attention projections (q/k/v/o_proj) concatenate `num_split` independent
+    heads along `split_dim`. Running Newton-Schulz on the whole fused matrix mixes the
+    heads together. When `num_split > 1` we instead split the matrix into per-head
+    blocks and orthogonalize each head independently, then recombine. When
+    `num_split <= 1` this is exactly the original whole-matrix orthogonalization.
+    """
+    if num_split <= 1:
+        return _zeropower_via_newtonschulz(update, ns_coefficients, ns_steps, eps)
+    if update.shape[split_dim] % num_split != 0:
+        raise ValueError(
+            f"Cannot split dim {split_dim} of size {update.shape[split_dim]} into "
+            f"{num_split} heads for per-head Muon orthogonalization."
+        )
+    chunks = torch.chunk(update, num_split, dim=split_dim)
+    ortho_chunks = [
+        _zeropower_via_newtonschulz(c, ns_coefficients, ns_steps, eps) for c in chunks
+    ]
+    return torch.cat(ortho_chunks, dim=split_dim)
+
+
 class Muon(Optimizer):
     def __init__(
         self,
@@ -122,6 +152,11 @@ class Muon(Optimizer):
             "eps": eps,
             "ns_steps": ns_steps,
             "adjust_lr_fn": adjust_lr_fn,
+            # Per-head (Kimi-K3 style) orthogonalization defaults. Individual param
+            # groups may override `num_split` (> 1) and `split_dim` (0 or 1) so that
+            # fused attention projections are orthogonalized head-by-head.
+            "num_split": 1,
+            "split_dim": 0,
         }
         super().__init__(params, defaults)
 
@@ -197,6 +232,8 @@ class Muon(Optimizer):
                 eps=group["eps"],
                 ns_steps=group["ns_steps"],
                 adjust_lr_fn=group["adjust_lr_fn"],
+                num_split=group.get("num_split", 1),
+                split_dim=group.get("split_dim", 0),
                 has_complex=has_complex,
             )
         return loss
@@ -295,6 +332,8 @@ def _single_tensor_muon(
     ns_steps: int,
     eps: float,
     adjust_lr_fn: str | None,
+    num_split: int,
+    split_dim: int,
     has_complex: bool,
 ) -> None:
     lr = _to_scalar(lr)
@@ -310,9 +349,18 @@ def _single_tensor_muon(
         buf.lerp_(grad, 1 - momentum)
         update = grad.lerp(buf, momentum) if nesterov else buf
 
-        update = _zeropower_via_newtonschulz(update, ns_coefficients, ns_steps, eps)
+        update = _orthogonalize_maybe_per_head(
+            update, ns_coefficients, ns_steps, eps, num_split, split_dim
+        )
 
-        adjusted_lr = _adjust_lr(lr, adjust_lr_fn, param.shape)
+        # For per-head orthogonalization the update RMS is set by the per-head block
+        # shape, so the RMS-matching LR adjustment should also use the block shape.
+        if num_split > 1:
+            block_shape = list(param.shape)
+            block_shape[split_dim] = block_shape[split_dim] // num_split
+            adjusted_lr = _adjust_lr(lr, adjust_lr_fn, torch.Size(block_shape))
+        else:
+            adjusted_lr = _adjust_lr(lr, adjust_lr_fn, param.shape)
 
         param.mul_(1 - lr * weight_decay)
         param.add_(update, alpha=-adjusted_lr)
@@ -333,6 +381,8 @@ def muon(
     ns_steps: int,
     eps: float,
     adjust_lr_fn: str | None,
+    num_split: int,
+    split_dim: int,
     has_complex: bool,
 ) -> None:
     r"""Functional API that performs Muon algorithm computation.
@@ -356,5 +406,7 @@ def muon(
         ns_steps=ns_steps,
         eps=eps,
         adjust_lr_fn=adjust_lr_fn,
+        num_split=num_split,
+        split_dim=split_dim,
         has_complex=has_complex,
     )

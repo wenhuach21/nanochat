@@ -1,4 +1,4 @@
-#!/bin/bash
+#m, !/bin/bash
 
 # export CUBLAS_WORKSPACE_CONFIG=':4096:8'
 #export HF_HOME="/models/huggingface/"

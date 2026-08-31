@@ -1,28 +1,84 @@
+"""Hyperparameter sweep for the ~2B Qwen3.5 (text-only) LLM.
+
+Python port modeled on run_sweep_3p5.py, but the FIXED_ARGS reproduce the
+architecture of the official Qwen3.5 2B text config, namely:
+
+    hidden_size            = 2048
+    head_dim               = 256   -> num_attention_heads = 8
+    num_key_value_heads    = 2     (GQA)
+    intermediate_size      = 6144  (= hidden_size * 3, set automatically by the trainer)
+    num_hidden_layers      = 24    (swept via `depth`)
+    full_attention_interval= 4     (layer_types = [L,L,L,F] repeated)
+    GatedDeltaNet (linear attention):
+        linear_key_head_dim   = 128
+        linear_value_head_dim = 128
+        linear_num_key_heads  = 16
+        linear_num_value_heads= 16
+        linear_conv_kernel_dim= 4
+    rope:
+        rope_theta            = 1e7
+        partial_rotary_factor = 0.25
+
+NOTE (per request): mtp_* and tie_word_embeddings from the reference config are
+intentionally NOT reproduced here. vocab_size follows the training tokenizer.
+
+Run from the repository root, e.g.:
+    CUDA_VISIBLE_DEVICES=0,1,2,3 python run_sweep_3p5_2b.py
+
+For every combination in the cartesian product below it launches one training run.
+Runs that already trained all the way to the final step are skipped (based on the
+per-run training log), so the sweep is safe to re-run / resume.
+"""
+
 import os
-import sys
-import time
-import csv
 import re
+import sys
+import csv
+import time
 import subprocess
 import traceback
 from datetime import datetime, timedelta, timezone
 from itertools import product
 from pathlib import Path
 
-LABEL = "Qwen-0813-d14-100-webedu"
+LABEL = "qwen3p5-2b-sweep"
 
+# ----------------------------------------------------------------------------
+# Sweep space (edit these arrays). The cartesian product is trained one by one.
 SWEEP_SPACE = {
-    "depth": [28],
+    "depth": [24],
     "lr": [3e-3],
-    "weight-decay": [0.02],
-    "warmup-ratio": [0.00],
-    "hidden-size": [1024],
-    "embedding-lr": [0.3],
-    "target-param-data-ratio": [100],
-    "grad-max-norm": [-1.0],
+    "weight-decay": [0.2],
+    "warmup-ratio": [0.0],
+    "target-param-data-ratio": [12],
+}
+
+# Fixed knobs shared by every run in the sweep. These pin the 2B architecture.
+FIXED_ARGS = {
+    "hidden-size": 2048,
+    "head-dim": 256,
+    "num-kv-heads": 2,
+    "full-attention-interval": 4,
+    # GatedDeltaNet linear-attention geometry (decoupled from softmax attention)
+    "linear-conv-kernel-dim": 4,
+    "linear-key-head-dim": 128,
+    "linear-value-head-dim": 128,
+    "linear-num-key-heads": 16,
+    "linear-num-value-heads": 16,
+    # rope
+    "rope-theta": 10000000,
+    "partial-rotary-factor": 0.25,
+    # training
+    "max-seq-len": 2048,
+    "device-batch-size": 4,
+    "total-batch-size": 524288,
+    "tokenizer-backend": "transformers",
 }
 
 TOKENS_PER_ITER = 524288
+
+os.environ.setdefault("OMP_NUM_THREADS", "8")
+os.environ.setdefault("CUDA_VISIBLE_DEVICES", "0,1,2,3")
 
 
 def get_nproc_per_node():
@@ -32,18 +88,13 @@ def get_nproc_per_node():
 
 
 NPROC_PER_NODE = get_nproc_per_node()
-WANDB_RUN = os.environ.get("WANDB_RUN", f"sweep_{LABEL}")
-EVAL_TOKENS = 100 * 524288  # ~100M tokens
-
-os.environ["OMP_NUM_THREADS"] = "1"
 
 base_dir = os.environ.get("NANOCHAT_BASE_DIR", str(Path.home() / ".cache" / "nanochat"))
-results_dir = Path(base_dir) / f"hparam_sweep_results_{LABEL}"
+results_dir = Path(base_dir) / f"hparam_sweep_{LABEL}"
 results_dir.mkdir(parents=True, exist_ok=True)
 
 results_file = results_dir / "results.csv"
 SWEEP_PARAM_COLUMNS = [k.replace("-", "_") for k in SWEEP_SPACE.keys()]
-BOOL_FLAG_KEYS = {"ema-eval"}
 
 
 # -------------------------
@@ -53,48 +104,31 @@ def log(msg):
     print(f"[{time.strftime('%Y-%m-%d %H:%M:%S')}] {msg}")
 
 
-def approximately_equal(csv_val, target):
-    try:
-        return abs(float(csv_val) - float(target)) <= max(1e-12, abs(float(target)) * 1e-9)
-    except Exception:
-        return str(csv_val) == str(target)
+def value_for_tag(v):
+    if isinstance(v, bool):
+        return "1" if v else "0"
+    if isinstance(v, float):
+        return f"{v:g}".replace(".", "p")
+    return str(v)
 
 
-def run_exists(sweep_values):
-    if not results_file.exists():
-        return False
-
-    with open(results_file) as f:
-        reader = csv.DictReader(f)
-        for row in reader:
-            if not row:
-                continue
-
-            matched = True
-            for k, v in sweep_values.items():
-                col = k.replace("-", "_")
-                if not approximately_equal(row.get(col, ""), v):
-                    matched = False
-                    break
-
-            if matched:
-                return True
-    return False
+def sanitize(v):
+    return re.sub(r"[^A-Za-z0-9]", "_", str(v).replace(".", "p"))
 
 
 def build_tag(sweep_values):
-    tag_suffix = "_".join(
-        f"{k.replace('-', '')}{value_for_tag(v)}"
-        for k, v in sweep_values.items()
+    return (
+        f"sweep_{LABEL}"
+        f"_d{sanitize(sweep_values['depth'])}"
+        f"_lr{sanitize(sweep_values['lr'])}"
+        f"_wd{sanitize(sweep_values['weight-decay'])}"
+        f"_wu{sanitize(sweep_values['warmup-ratio'])}"
+        f"_r{sanitize(sweep_values['target-param-data-ratio'])}"
     )
-    return f"sweep_{LABEL}_{tag_suffix}"
 
 
 def extract_last_step_progress(text):
-    """Parse the last 'step X/Y' training log line -> (last_step, total_iterations).
-
-    Returns (None, None) if no training step line is present.
-    """
+    """Parse the last 'step X/Y' training log line -> (last_step, total_iterations)."""
     matches = re.findall(r"step\s+(\d+)/(\d+)", text)
     if not matches:
         return None, None
@@ -103,26 +137,19 @@ def extract_last_step_progress(text):
 
 
 def run_completed(sweep_values):
-    """A run counts as done ONLY if training fully reached the final step (num_iterations).
-
-    A result row (or checkpoint) may exist even when a run was intentionally paused early
-    via --end-step; in that case we want to continue it, not skip it. So instead of just
-    checking whether a CSV row exists, we inspect the per-run training log and require that
-    the last logged step reached the total number of iterations.
-    """
-    log_file = results_dir / f"{build_tag(sweep_values)}_train.log"
+    """A run counts as done ONLY if training fully reached the final step."""
+    log_file = results_dir / f"{build_tag(sweep_values)}.log"
     if not log_file.exists():
         return False
     text = log_file.read_text(errors="ignore")
     last_step, total = extract_last_step_progress(text)
     if last_step is None or not total:
         return False
-    # training logs step in [0, total-1]; reaching total-1 means the final step was trained
+    # training logs step in [0, total-1]; reaching total-1 means the final step trained
     return last_step + 1 >= total
 
 
 def grep_last(pattern, text):
-    import re
     matches = re.findall(pattern, text)
     return matches[-1] if matches else ""
 
@@ -134,7 +161,7 @@ def extract_int(pattern, text):
     val = val.replace(",", "")
     try:
         return int(val)
-    except:
+    except Exception:
         return ""
 
 
@@ -142,7 +169,7 @@ def extract_float(pattern, text):
     val = grep_last(pattern, text)
     try:
         return float(val)
-    except:
+    except Exception:
         return ""
 
 
@@ -150,23 +177,8 @@ def extract_named_int(name, text):
     return extract_int(rf"{name}:\s*([\d,]+)", text) or 0
 
 
-def value_for_tag(v):
-    if isinstance(v, bool):
-        return "1" if v else "0"
-    if isinstance(v, float):
-        return f"{v:g}".replace(".", "p")
-    return str(v)
-
-
-def build_cli_arg(k, v):
-    if k in BOOL_FLAG_KEYS:
-        return f"--{k}" if bool(v) else None
-    return f"--{k}={v}"
-
-
 def tail_lines(text, n=40):
-    lines = text.splitlines()
-    return "\n".join(lines[-n:])
+    return "\n".join(text.splitlines()[-n:])
 
 
 def get_git_commit_hash():
@@ -186,21 +198,7 @@ def beijing_time_str():
 
 
 def extract_all_task_metrics(text):
-    """
-    Extract all completed eval blocks from the log.
-    Returns a list like:
-    [
-        {
-            "eval_step": 5000,
-            "core_metric": -0.05,
-            "tasks": {
-                "arc_easy": {"accuracy": 0.2, "centered": -0.01},
-                ...
-            },
-        },
-        ...
-    ]
-    """
+    """Extract all completed eval blocks from the log."""
     task_pattern = re.compile(
         r"Evaluating:\s+([^()]+)\s+\([^)]+\).*?accuracy:\s+([-+]?\d*\.?\d+)\s+\|\s+centered:\s+([-+]?\d*\.?\d+)"
     )
@@ -212,10 +210,10 @@ def extract_all_task_metrics(text):
     for line in text.splitlines():
         task_match = task_pattern.search(line)
         if task_match:
-            task_name = task_match.group(1).strip()
-            accuracy = float(task_match.group(2))
-            centered = float(task_match.group(3))
-            current_tasks[task_name] = {"accuracy": accuracy, "centered": centered}
+            current_tasks[task_match.group(1).strip()] = {
+                "accuracy": float(task_match.group(2)),
+                "centered": float(task_match.group(3)),
+            }
             continue
 
         core_match = core_pattern.search(line)
@@ -228,18 +226,6 @@ def extract_all_task_metrics(text):
             current_tasks = {}
 
     return all_eval_blocks
-
-
-def extract_task_metrics(text):
-    """
-    Extract task evaluations from the last completed eval block in the log.
-    This is used for summary purposes when there are multiple eval rounds.
-    Returns dict: { task_name: { "accuracy": float, "centered": float }, ... }
-    """
-    all_eval_blocks = extract_all_task_metrics(text)
-    if all_eval_blocks:
-        return all_eval_blocks[-1]["tasks"]
-    return {}
 
 
 # -------------------------
@@ -258,19 +244,18 @@ header = [
     "train_time_sec",
 ]
 
+
 def main():
     if not results_file.exists():
         with open(results_file, "w", newline="") as f:
             csv.writer(f).writerow(header)
 
-    # -------------------------
-    # main loop
-    # -------------------------
     sweep_keys = list(SWEEP_SPACE.keys())
     sweep_combos = product(*(SWEEP_SPACE[k] for k in sweep_keys))
 
     log("=" * 50)
-    log(f"Hyperparameter sweep start: {SWEEP_SPACE}")
+    log(f"Qwen3.5 2B sweep start (GPUs={os.environ.get('CUDA_VISIBLE_DEVICES')}, nproc={NPROC_PER_NODE})")
+    log(f"Sweep space: {SWEEP_SPACE}")
     log("=" * 50)
 
     git_commit = get_git_commit_hash()
@@ -278,56 +263,38 @@ def main():
 
     for combo in sweep_combos:
         sweep_values = dict(zip(sweep_keys, combo))
-        d = int(sweep_values["depth"])
         run_datetime_bj = beijing_time_str()
 
-        # Reduce duplicate combinations:
-        # - AdamW mode ignores muon-lr, keep only the first value
-        # - EMA eval is meaningful only when ema-decay > 0
-        if sweep_values.get("optimizer-mode") == "adamw":
-            muon_candidates = SWEEP_SPACE.get("muon-lr", [])
-            if muon_candidates and sweep_values.get("muon-lr") != muon_candidates[0]:
-                continue
-        if float(sweep_values.get("ema-decay", 0.0)) <= 0.0 and bool(sweep_values.get("ema-eval", False)):
-            continue
-
         if run_completed(sweep_values):
-            log(f"Skipping {sweep_values} (already fully trained to final step)")
+            log(f"SKIP {sweep_values} (already fully trained to final step)")
             continue
 
-        tag_suffix = "_".join(
-            f"{k.replace('-', '')}{value_for_tag(v)}"
-            for k, v in sweep_values.items()
-        )
-        tag = f"sweep_{LABEL}_{tag_suffix}"
+        tag = build_tag(sweep_values)
         start_time = time.time()
 
         cmd = [
             "torchrun",
             "--standalone",
             f"--nproc_per_node={NPROC_PER_NODE}",
-            "-m", "scripts.base_train_qwen3",
+            "-m", "nanochat.qwen35.base_train_qwen3p5",
             "--",
-            *(arg for k, v in sweep_values.items() for arg in [build_cli_arg(k, v)] if arg is not None),
-            f"--run={WANDB_RUN}_{tag}",
+            f"--run={tag}",
             f"--model-tag={tag}",
+            *(f"--{k}={v}" for k, v in FIXED_ARGS.items()),
+            *(f"--{k}={v}" for k, v in sweep_values.items()),
             "--core-metric-every=1000",
             "--core-metric-max-per-task=-1",
-            "--sample-every=1000",
+            "--sample-every=-1",
             "--save-every=5000",
-            "--end-step=-1"  # -1 means no end step (train to full horizon)
         ]
 
-        log_file = results_dir / f"{tag}_train.log"
-
-        log(f"Training {sweep_values}...")
+        log_file = results_dir / f"{tag}.log"
+        log(f"TRAIN {tag}")
 
         with open(log_file, "w", encoding="utf-8") as lf:
-            # Save the full launch command for reproducibility/debugging.
             lf.write("# cmd: " + " ".join(cmd) + "\n")
             lf.flush()
             try:
-                # Tee child output to both terminal and log file for realtime debug.
                 popen = subprocess.Popen(
                     cmd,
                     stdout=subprocess.PIPE,
@@ -350,60 +317,36 @@ def main():
                 log(f"See log for traceback: {log_file}")
                 continue
 
-        class _ProcResult:
-            def __init__(self, rc):
-                self.returncode = rc
-
-        proc = _ProcResult(returncode)
-
         train_time = int(time.time() - start_time)
         text = log_file.read_text(errors="ignore")
 
-        # Extract task-level metrics
         all_task_metrics = extract_all_task_metrics(text)
-        task_metrics = extract_task_metrics(text)
 
         params_total = extract_named_int("total", text)
-
-        num_iters = extract_int(r"Calculated number of iterations.*: ([\d,]+)", text)
-        num_iters = num_iters or 0
-
+        num_iters = extract_int(r"Calculated number of iterations.*: ([\d,]+)", text) or 0
         tokens_trained = num_iters * TOKENS_PER_ITER
-
-        # Extract final step loss (last occurrence)
         final_loss = extract_float(r"step\s+\d+/\d+\s+\([^)]+\)\s+\|\s+loss:\s+([\d.]+)", text) or 0.0
-
         val_bpb = extract_float(r"Validation bpb:\s*([\d.]+)", text)
         core_score = extract_float(r"CORE metric:\s*([-+]?\d*\.?\d+)", text) or 0.0
 
-        if proc.returncode != 0:
-            log(f"WARNING: training process exited with code {proc.returncode} for {sweep_values}")
+        if returncode != 0:
+            log(f"WARNING: training process exited with code {returncode} for {sweep_values}")
             if text:
                 log("Last log lines:")
                 print(tail_lines(text, 60))
             log(f"Full log path: {log_file}")
 
-        log(
-            f"Params: {params_total}, iters: {num_iters}, "
-            f"bpb: {val_bpb}, core: {core_score}"
-        )
+        log(f"Params: {params_total}, iters: {num_iters}, bpb: {val_bpb}, core: {core_score}")
 
-        # -------------------------
-        # write csv
-        # -------------------------
         with open(results_file, "a", newline="") as f:
             csv.writer(f).writerow([
                 run_datetime_bj,
                 git_commit,
                 *(sweep_values[k] for k in sweep_keys),
                 params_total, num_iters, tokens_trained,
-                final_loss,
-                val_bpb, core_score, train_time
+                final_loss, val_bpb, core_score, train_time,
             ])
 
-        # Save task metrics to a single standalone CSV file.
-        # If there are multiple eval rounds, keep them all here;
-        # summary metrics above still come from the last completed eval block.
         if all_task_metrics:
             tasks_csv_file = results_dir / f"{tag}_tasks.csv"
             with open(tasks_csv_file, "w", newline="") as f:
@@ -421,14 +364,10 @@ def main():
                         ])
             log(f"Saved {len(all_task_metrics)} eval rounds to CSV: {tasks_csv_file}")
 
-
     log("=" * 50)
-    log("Hyperparameter Sweep Complete")
+    log(f"Qwen3.5 2B sweep complete. Results in: {results_dir}")
     log("=" * 50)
 
-    log(f"Results saved to: {results_file}")
-
-    # print table (simple version)
     print()
     print(results_file.read_text())
 

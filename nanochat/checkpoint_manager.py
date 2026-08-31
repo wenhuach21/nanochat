@@ -79,16 +79,116 @@ def save_checkpoint(checkpoint_dir, step, model_data, optimizer_data, meta_data,
         with open(meta_path, "w", encoding="utf-8") as f:
             json.dump(meta_data, f, indent=2)
         logger.info(f"Saved metadata to: {meta_path}")
-    # Under plain DDP the optimizer state is *replicated* (not sharded): gradients are
-    # all-reduced so every rank derives identical optimizer state. We still save one file
-    # per rank for convenience/robustness, but any shard is interchangeable -- which is why
-    # load_checkpoint can safely fall back to another rank's shard when resuming with a
-    # different world size (e.g. 2 GPUs -> 4 GPUs).
+    # NOTE: multi-GPU training uses DistMuonAdamW, a ZeRO-2 style *sharded* optimizer
+    # (see nanochat/optim.py). Each rank holds only its own 1/world_size slice of the
+    # optimizer state (AdamW exp_avg/exp_avg_sq for large params, and Muon momentum /
+    # second-momentum buffers), so the per-rank shards are NOT identical and NOT
+    # interchangeable -- every rank must save its own shard for a correct resume.
+    # Only tiny (<1024 elem) AdamW params are replicated across ranks. Because the shard
+    # boundaries depend on world_size, a checkpoint can in general only be resumed with the
+    # same world_size it was saved with; resuming with a different world_size will not
+    # reconstruct the correct state (see load_checkpoint / load_optimizer_state).
     if optimizer_data is not None:
         os.makedirs(checkpoint_dir, exist_ok=True)
         optimizer_path = os.path.join(checkpoint_dir, f"optim_{step:06d}_rank{rank:d}.pt")
         _atomic_torch_save(_to_cpu(optimizer_data), optimizer_path)
         logger.info(f"Saved optimizer state to: {optimizer_path}")
+
+def save_hf_checkpoint(save_dir, model, tokenizer=None, optimizer_data=None, meta_data=None, dtype=None, safe_serialization=True):
+    """Save a model (and optionally the tokenizer) in a transformers-compatible format.
+
+    Produces `config.json` + `model.safetensors` (via `PreTrainedModel.save_pretrained`) so the
+    result is directly loadable with `AutoModelForCausalLM.from_pretrained(save_dir)`. When a
+    tokenizer is given it is exported via its `save_pretrained` into the same directory so
+    `AutoTokenizer.from_pretrained(save_dir)` works too.
+
+    Optionally also saves the optimizer state (`optim.pt`) and training metadata (`meta.json`)
+    alongside the model so that training can still be resumed from an HF-format checkpoint
+    (see `load_hf_checkpoint` / `load_checkpoint_any`).
+    """
+    os.makedirs(save_dir, exist_ok=True)
+    # Unwrap common wrappers: DDP (.module) and torch.compile (._orig_mod)
+    m = getattr(model, "module", model)
+    m = getattr(m, "_orig_mod", m)
+    if not hasattr(m, "save_pretrained"):
+        raise TypeError(
+            f"Model of type {type(m).__name__} does not support save_pretrained; "
+            f"expected a transformers PreTrainedModel (e.g. Qwen3ForCausalLM)."
+        )
+    if dtype is not None:
+        m = m.to(dtype)
+    m.save_pretrained(save_dir, safe_serialization=safe_serialization)
+    logger.info(f"Saved transformers-compatible model to: {save_dir}")
+    if tokenizer is not None:
+        if hasattr(tokenizer, "save_pretrained"):
+            tokenizer.save_pretrained(save_dir)
+            logger.info(f"Saved transformers-compatible tokenizer to: {save_dir}")
+        else:
+            logger.warning(f"Tokenizer of type {type(tokenizer).__name__} has no save_pretrained; skipping.")
+    # Save optimizer/loop state so an HF checkpoint can also be resumed.
+    if optimizer_data is not None:
+        optim_path = os.path.join(save_dir, "optim.pt")
+        _atomic_torch_save(_to_cpu(optimizer_data), optim_path)
+        logger.info(f"Saved optimizer state to: {optim_path}")
+    if meta_data is not None:
+        meta_path = os.path.join(save_dir, "meta.json")
+        with open(meta_path, "w", encoding="utf-8") as f:
+            json.dump(meta_data, f, indent=2)
+        logger.info(f"Saved metadata to: {meta_path}")
+
+
+def _load_hf_state_dict(hf_dir, device):
+    """Load a model state_dict from an HF-format directory (safetensors, possibly sharded)."""
+    from safetensors.torch import load_file
+    index_path = os.path.join(hf_dir, "model.safetensors.index.json")
+    state = {}
+    if os.path.exists(index_path):
+        with open(index_path, "r", encoding="utf-8") as f:
+            index = json.load(f)
+        shard_files = sorted(set(index["weight_map"].values()))
+        for shard in shard_files:
+            state.update(load_file(os.path.join(hf_dir, shard), device=str(device)))
+    else:
+        single = os.path.join(hf_dir, "model.safetensors")
+        if os.path.exists(single):
+            state = load_file(single, device=str(device))
+        else:
+            bin_path = os.path.join(hf_dir, "pytorch_model.bin")
+            if not os.path.exists(bin_path):
+                raise FileNotFoundError(f"No model weights (safetensors/bin) found in {hf_dir}")
+            state = torch.load(bin_path, map_location=device)
+    return state
+
+
+def load_hf_checkpoint(hf_dir, device, load_optimizer=False):
+    """Load model_data / optimizer_data / meta_data from an HF-format checkpoint directory."""
+    model_data = _load_hf_state_dict(hf_dir, device)
+    optimizer_data = None
+    if load_optimizer:
+        optim_path = os.path.join(hf_dir, "optim.pt")
+        if os.path.exists(optim_path):
+            optimizer_data = torch.load(optim_path, map_location=device)
+        else:
+            log0(f"No optimizer state found in HF checkpoint {hf_dir} (optim.pt missing)")
+    meta_path = os.path.join(hf_dir, "meta.json")
+    meta_data = None
+    if os.path.exists(meta_path):
+        with open(meta_path, "r", encoding="utf-8") as f:
+            meta_data = json.load(f)
+    return model_data, optimizer_data, meta_data
+
+
+def load_checkpoint_any(checkpoint_dir, step, device, load_optimizer=False, rank=0):
+    """Load a checkpoint at `step`, auto-detecting nanochat (.pt) vs HF (hf_<step>/) format."""
+    pt_model = os.path.join(checkpoint_dir, f"model_{step:06d}.pt")
+    if os.path.exists(pt_model):
+        return load_checkpoint(checkpoint_dir, step, device, load_optimizer=load_optimizer, rank=rank)
+    hf_dir = os.path.join(checkpoint_dir, f"hf_{step:06d}")
+    if os.path.isdir(hf_dir):
+        return load_hf_checkpoint(hf_dir, device, load_optimizer=load_optimizer)
+    raise FileNotFoundError(
+        f"No checkpoint found for step {step} in {checkpoint_dir} (looked for model_{step:06d}.pt and hf_{step:06d}/)"
+    )
 
 def load_checkpoint(checkpoint_dir, step, device, load_optimizer=False, rank=0):
     # Load the model state
@@ -99,10 +199,13 @@ def load_checkpoint(checkpoint_dir, step, device, load_optimizer=False, rank=0):
     if load_optimizer:
         optimizer_path = os.path.join(checkpoint_dir, f"optim_{step:06d}_rank{rank:d}.pt")
         if not os.path.exists(optimizer_path):
-            # The checkpoint may have been saved with fewer ranks than we are resuming with
-            # (e.g. saved with 2 GPUs, resuming with 4). The optimizer state is only weakly
-            # coupled to the specific rank, so fall back to an available shard. We map this
-            # rank onto the available shards round-robin to spread them out a bit.
+            # The optimizer state is ZeRO-2 *sharded* (see save_checkpoint / optim.py), so a
+            # shard is specific to its rank and NOT interchangeable. A missing shard usually
+            # means we are resuming with a different world_size than was used when saving, in
+            # which case the shard boundaries no longer line up and the state cannot be
+            # reconstructed correctly. We fall back to an available shard only as a
+            # best-effort last resort to allow training to continue, but WARN loudly because
+            # the loaded optimizer state will be wrong for most parameters.
             available = sorted(
                 int(re.search(r"_rank(\d+)\.pt$", f).group(1))
                 for f in glob.glob(os.path.join(checkpoint_dir, f"optim_{step:06d}_rank*.pt"))
@@ -114,9 +217,11 @@ def load_checkpoint(checkpoint_dir, step, device, load_optimizer=False, rank=0):
             fallback_rank = available[rank % len(available)]
             fallback_path = os.path.join(checkpoint_dir, f"optim_{step:06d}_rank{fallback_rank:d}.pt")
             log0(
-                f"Optimizer shard for rank{rank} not found ({optimizer_path}); "
-                f"falling back to rank{fallback_rank} ({fallback_path}). "
-                f"Available shards: {available}"
+                f"WARNING: optimizer shard for rank{rank} not found ({optimizer_path}); "
+                f"the optimizer state is sharded, so this likely means the world_size changed "
+                f"since saving ({len(available)} shards available: {available}). "
+                f"Falling back to rank{fallback_rank} ({fallback_path}) as a best-effort resume; "
+                f"the optimizer state will be INCORRECT for most parameters."
             )
             optimizer_path = fallback_path
         optimizer_data = torch.load(optimizer_path, map_location=device)
@@ -240,7 +345,11 @@ def load_optimizer_state(source, device, rank, model_tag=None, step=None):
         step = find_last_step(checkpoint_dir)
     optimizer_path = os.path.join(checkpoint_dir, f"optim_{step:06d}_rank{rank:d}.pt")
     if not os.path.exists(optimizer_path):
-        # Resuming with more ranks than were saved: fall back to an available shard.
+        # The optimizer state is ZeRO-2 *sharded* (see save_checkpoint / optim.py): each
+        # shard belongs to a specific rank and is NOT interchangeable. A missing shard
+        # generally means the world_size changed since saving, so the shard boundaries no
+        # longer match and the state cannot be reconstructed correctly. Fall back to an
+        # available shard only as a best-effort last resort, and WARN loudly.
         available = sorted(
             int(re.search(r"_rank(\d+)\.pt$", f).group(1))
             for f in glob.glob(os.path.join(checkpoint_dir, f"optim_{step:06d}_rank*.pt"))
@@ -251,8 +360,10 @@ def load_optimizer_state(source, device, rank, model_tag=None, step=None):
         fallback_rank = available[rank % len(available)]
         fallback_path = os.path.join(checkpoint_dir, f"optim_{step:06d}_rank{fallback_rank:d}.pt")
         log0(
-            f"Optimizer shard for rank{rank} not found; falling back to rank{fallback_rank}. "
-            f"Available shards: {available}"
+            f"WARNING: optimizer shard for rank{rank} not found; the optimizer state is "
+            f"sharded, so this likely means the world_size changed since saving "
+            f"({len(available)} shards available: {available}). Falling back to rank{fallback_rank} "
+            f"as a best-effort resume; the optimizer state will be INCORRECT for most parameters."
         )
         optimizer_path = fallback_path
     log0(f"Loading optimizer state from {optimizer_path}")

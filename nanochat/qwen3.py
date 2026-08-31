@@ -449,6 +449,15 @@ class Qwen3ForCausalLM(Qwen3PreTrainedModel, GenerationMixin):
         self.model = Qwen3Model(config)
         self.vocab_size = config.vocab_size
         self.lm_head = nn.Linear(config.hidden_size, config.vocab_size, bias=False)
+        # Logit softcap that AUTOMATICALLY anneals away during training, and is NEVER used at
+        # inference. Early training applies softcap=softcap_start for stability; as training
+        # progresses the cap grows (softcap*tanh(x/softcap) -> identity) and is fully disabled
+        # after `softcap_anneal_steps` training steps. The step counter is a persistent buffer,
+        # so annealing resumes correctly after checkpoint reload. No training-loop code needed.
+        self.softcap_start = float(getattr(config, "logit_softcap", 15.0) or 0.0)
+        self.softcap_end = float(getattr(config, "logit_softcap_end", 100.0) or 0.0)
+        self.softcap_anneal_steps = int(getattr(config, "logit_softcap_anneal_steps", 2000) or 0)
+        self.register_buffer("_softcap_step", torch.zeros((), dtype=torch.long), persistent=True)
         # Optional MTP heads for predicting farther-future tokens from the same hidden state.
         self.mtp_num_heads = int(getattr(config, "mtp_num_heads", 0) or 0)
         self.mtp_weight = float(getattr(config, "mtp_weight", 0.0) or 0.0)
@@ -540,12 +549,30 @@ class Qwen3ForCausalLM(Qwen3PreTrainedModel, GenerationMixin):
             return None
         return sum(mtp_losses) / len(mtp_losses)
 
+    def _current_softcap(self):
+        """Softcap value for the current training step, or None once fully annealed / disabled.
+
+        Grows exponentially from softcap_start -> softcap_end over softcap_anneal_steps; a large
+        cap makes softcap*tanh(x/softcap) ~ identity, and past anneal_steps we drop it entirely.
+        """
+        if self.softcap_start <= 0 or self.softcap_anneal_steps <= 0:
+            return None
+        step = int(self._softcap_step.item())
+        if step >= self.softcap_anneal_steps:
+            return None  # fully degraded -> no softcap at all
+        p = step / self.softcap_anneal_steps
+        return self.softcap_start * (self.softcap_end / self.softcap_start) ** p
+
     def forward(self, idx, targets=None, kv_cache=None, loss_reduction='mean'):
         logits, hidden_states = self.forward1(idx, labels=targets, return_hidden_states=True)
         logits = logits.float()  # switch to fp32 for logit softcap and loss computation
-        softcap = 15  # smoothly cap the logits to the range [-softcap, softcap]
-        logits = softcap * torch.tanh(logits / softcap)  # squash the logits
-
+        # Softcap is applied ONLY during training and automatically anneals to nothing.
+        # Inference (targets is None) never touches the logits -> matches vanilla Qwen3.
+        if targets is not None:
+            softcap = self._current_softcap()
+            if softcap is not None:
+                logits = softcap * torch.tanh(logits / softcap)  # squash the logits
+            self._softcap_step += 1  # advance the auto-anneal counter
 
         if targets is not None:
             # training: given the targets, compute and return the loss
