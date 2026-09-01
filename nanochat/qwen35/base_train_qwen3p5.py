@@ -89,6 +89,10 @@ parser.add_argument("--ema-decay", type=float, default=0.0, help="EMA decay for 
 parser.add_argument("--ema-eval", action="store_true", help="evaluate/sample/save with EMA parameters when EMA is enabled")
 parser.add_argument("--mtp-num-heads", type=int, default=0, help="number of auxiliary MTP heads (0 disables MTP)")
 parser.add_argument("--mtp-weight", type=float, default=0.0, help="weight for MTP auxiliary loss")
+# Logit softcap: softcap*tanh(x/softcap) applied during training then annealed away.
+parser.add_argument("--logit-softcap", type=float, default=15.0, help="logit softcap start value (0 disables softcap)")
+parser.add_argument("--logit-softcap-end", type=float, default=100.0, help="logit softcap end value (grows toward this while annealing)")
+parser.add_argument("--logit-softcap-anneal-steps", type=int, default=2000, help="steps over which the softcap anneals away. Set -1 to freeze the softcap at --logit-softcap (e.g. constant 15) forever.")
 # DFLASH joint pretraining (block-diffusion draft trained online with the base model)
 parser.add_argument("--dflash-enable", action="store_true", help="train a DFLASH draft jointly during pretraining")
 parser.add_argument("--dflash-layers", type=int, default=1, help="number of DFLASH draft decoder layers")
@@ -202,6 +206,9 @@ def build_model_meta(depth, hidden_size_override=None, num_kv_heads_override=Non
     )
     config.mtp_num_heads = max(0, int(args.mtp_num_heads))
     config.mtp_weight = max(0.0, float(args.mtp_weight))
+    config.logit_softcap = float(args.logit_softcap)
+    config.logit_softcap_end = float(args.logit_softcap_end)
+    config.logit_softcap_anneal_steps = int(args.logit_softcap_anneal_steps)
     with torch.device("meta"):
         model_meta = Qwen3_5ForCausalLM(config)
     return model_meta
@@ -216,6 +223,12 @@ print0(f"Layer types: {model_config.layer_types}")
 model.to_empty(device=device)  # 2) storage on device but uninitialized
 model.post_init()              # 3) initialize tensors
 model.re_init_weights()
+
+# If softcap annealing is disabled (--logit-softcap-anneal-steps -1), freeze the softcap
+# at --logit-softcap (e.g. constant 15) by setting the step counter to -1.
+softcap_frozen = int(args.logit_softcap_anneal_steps) < 0
+if softcap_frozen and hasattr(model, "set_softcap_step"):
+    model.set_softcap_step(-1)
 
 # ---- Depth Expansion (Model Growth) ----
 if args.expand_from is not None:
@@ -304,8 +317,9 @@ if resuming:
     model.load_state_dict(model_data, strict=True, assign=True)
     # `_softcap_step` is a non-persistent buffer (not in the checkpoint), so re-sync it
     # from the resumed step to keep the logit-softcap annealing schedule correct.
+    # When the softcap is frozen (--logit-softcap-anneal-steps -1) keep it pinned at -1.
     if hasattr(model, "set_softcap_step"):
-        model.set_softcap_step(args.resume_from_step)
+        model.set_softcap_step(-1 if softcap_frozen else args.resume_from_step)
     del model_data
 elif args.init_from:
     init_dir = os.path.expanduser(args.init_from)
