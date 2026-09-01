@@ -86,3 +86,9 @@ run_datetime_bj,git_commit,depth,lr,weight_decay,warmup_ratio,hidden_size,embedd
 
 run_datetime_bj,git_commit,depth,lr,weight_decay,warmup_ratio,hidden_size,head_dim,num_kv_heads,embedding_lr,target_param_data_ratio,grad_max_norm,params_total,num_iterations,tokens_trained,final_loss,val_bpb,core_score,train_time_sec
 2026-08-19 14:04:55,d8a37842b7b5252db1b5dd6bf510068f9858397f,28,0.003,0.02,0.0,2048,128,8,0.3,100,-1.0,0,147211,77180960768,2.189171,,0.3607,1000807
+
+
+qwen35
+
+
+2026-08-31 11:22:41,a8beece5773aca6e68bf62f663e5eba1e782f22e,24,0.003,0.2,0.0,12,0,12937,6782713856,2.593488,,0.2096,67248

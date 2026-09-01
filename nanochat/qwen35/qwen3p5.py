@@ -904,9 +904,15 @@ class Qwen3_5ForCausalLM(Qwen3_5PreTrainedModel, GenerationMixin):
         self._softcap_step.fill_(int(step))
 
     def _current_softcap(self):
-        if self.softcap_start <= 0 or self.softcap_anneal_steps <= 0:
+        if self.softcap_start <= 0:
             return None
         step = int(self._softcap_step.item())
+        # step == -1 => freeze the softcap at softcap_start (e.g. 15) forever,
+        # never annealing away and always applied during training.
+        if step < 0:
+            return self.softcap_start
+        if self.softcap_anneal_steps <= 0:
+            return None
         if step >= self.softcap_anneal_steps:
             return None
         p = step / self.softcap_anneal_steps
@@ -919,7 +925,9 @@ class Qwen3_5ForCausalLM(Qwen3_5PreTrainedModel, GenerationMixin):
             softcap = self._current_softcap()
             if softcap is not None:
                 logits = softcap * torch.tanh(logits / softcap)
-            self._softcap_step += 1
+            # When frozen at -1 (constant softcap) don't advance the annealing counter.
+            if int(self._softcap_step.item()) >= 0:
+                self._softcap_step += 1
 
         if targets is not None:
             loss = F.cross_entropy(
