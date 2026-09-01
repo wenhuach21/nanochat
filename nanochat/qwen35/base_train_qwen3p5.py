@@ -84,6 +84,7 @@ parser.add_argument("--embedding-lr", type=float, default=0.3, help="learning ra
 parser.add_argument("--unembedding-lr", type=float, default=0.004, help="learning rate for unembedding (lm_head) parameters (Adam)")
 parser.add_argument("--weight-decay", type=float, default=0.2, help="weight decay for the Muon optimizer (for weights)")
 parser.add_argument("--muon-lr", type=float, default=0.02, help="learning rate for matrix parameters (Muon)")
+parser.add_argument("--muon-per-head", action="store_true", help="orthogonalize softmax-attention q/k/v/o_proj weights per attention head (Kimi-K3 style) instead of as one fused matrix")
 parser.add_argument("--optimizer-mode", type=str, default="hybrid", choices=["hybrid", "adamw"], help="optimizer setup: hybrid(AdamW+Muon) or adamw")
 parser.add_argument("--ema-decay", type=float, default=0.0, help="EMA decay for model parameters (0 disables EMA, e.g. 0.999)")
 parser.add_argument("--ema-eval", action="store_true", help="evaluate/sample/save with EMA parameters when EMA is enabled")
@@ -464,6 +465,30 @@ default_group = {"params": [], "lr": matrix_lr}
 lm_head_params = []
 adamw_all_params = []
 
+# Per-head Muon (Kimi-K3 style): softmax-attention projections concatenate heads
+# along one dim. Splitting them into per-head blocks lets Muon orthogonalize each
+# head independently instead of mixing heads in a single Newton-Schulz iteration.
+# q/k/v_proj concatenate heads along dim 0 (output rows); o_proj along dim 1 (input
+# cols). Under GQA q and k/v have different head counts, so they need separate groups.
+muon_per_head = args.muon_per_head and args.optimizer_mode == "hybrid"
+_ph_num_attention_heads = args.num_attention_heads if args.num_attention_heads > 0 else args.hidden_size // args.head_dim
+_ph_num_kv_heads = args.num_kv_heads if args.num_kv_heads > 0 else _ph_num_attention_heads
+per_head_q = {"params": [], "lr": matrix_lr, "num_split": _ph_num_attention_heads, "split_dim": 0}
+per_head_kv = {"params": [], "lr": matrix_lr, "num_split": _ph_num_kv_heads, "split_dim": 0}
+per_head_o = {"params": [], "lr": matrix_lr, "num_split": _ph_num_attention_heads, "split_dim": 1}
+
+def _match_per_head_group(name, m):
+    """Return the per-head Muon group for a softmax-attention proj weight, else None."""
+    if not muon_per_head or ".self_attn." not in name or m.dim() != 2:
+        return None
+    if name.endswith(".q_proj.weight") and m.shape[0] % _ph_num_attention_heads == 0:
+        return per_head_q
+    if (name.endswith(".k_proj.weight") or name.endswith(".v_proj.weight")) and m.shape[0] % _ph_num_kv_heads == 0:
+        return per_head_kv
+    if name.endswith(".o_proj.weight") and m.shape[1] % _ph_num_attention_heads == 0:
+        return per_head_o
+    return None
+
 for n, m in model.named_parameters():
     is_no_decay = any(nd in n for nd in no_decay)
     is_embed = "embed" in n
@@ -518,6 +543,14 @@ if args.optimizer_mode == "hybrid" and args.muon_lr >= 0:
     moun_parameters.extend(other_params.values())
     if default_group["params"]:
         moun_parameters.append(default_group)
+    # Per-head attention groups (only populated when --muon-per-head is set)
+    for ph_group in (per_head_q, per_head_kv, per_head_o):
+        if ph_group["params"]:
+            moun_parameters.append(ph_group)
+    if muon_per_head:
+        n_ph = sum(len(g["params"]) for g in (per_head_q, per_head_kv, per_head_o))
+        print0(f"Muon per-head enabled: {n_ph} attention proj matrices split "
+               f"(q heads={_ph_num_attention_heads}, kv heads={_ph_num_kv_heads})")
     if moun_parameters:
         muon_optimizer = torch.optim.Muon(moun_parameters, weight_decay=weight_decay_scaled, adjust_lr_fn="match_rms_adamw", lr=muon_lr)
         for group in muon_optimizer.param_groups:
