@@ -164,6 +164,35 @@ bash nanochat/qwen35/run_qwen3p5.sh
 评估 / 保存 / 断点续训：
 - `--core-metric-every`、`--core-metric-max-per-task`、`--sample-every`。
 - `--save-every`、`--save-format pt|hf|both`、`--model-tag`。
+  > **默认 `--save-format both`**：每个 save point（以及最后一步）都会同时写两种格式：
+  > - `pt`：nanochat 自己的 `.pt` 分片（含优化器分片），用于**断点续训**（`--resume-from-step`）。
+  > - `hf`：一个**可直接被 transformers 加载**的 safetensors 文件夹 `hf_<step>/`，通过
+  >   `save_pretrained` 生成，并**自动拷贝建模代码**（`qwen3p5.py`、`configuration_qwen3_5.py`）、
+  >   在 `config.json` 里写入 `auto_map`，同时把 tokenizer 相关文件（`tokenizer.json`、
+  >   `tokenizer_config.json`、`chat_template.jinja`）一并保存进去。整个文件夹自包含，
+  >   在**任何只装了 transformers 的机器**上都能直接加载：
+  >
+  >   `hf_<step>/` 完整内容（和官方发布的模型目录一致）：
+  >   ```
+  >   config.json               # 含 auto_map + bos/eos/pad token id
+  >   generation_config.json    # 含 bos/eos/pad token id（generate() 能正确停）
+  >   model.safetensors         # 权重
+  >   qwen3p5.py                # 建模代码（trust_remote_code 用）
+  >   configuration_qwen3_5.py  # 配置代码
+  >   tokenizer.json            # tokenizer 本体
+  >   tokenizer_config.json     # tokenizer 配置
+  >   chat_template.jinja       # 对话模板
+  >   optim.pt / meta.json      # 仅用于断点续训（transformers 加载时忽略）
+  >   ```
+  >   > 特殊 token id 会从 tokenizer 自动同步进 `config.json` / `generation_config.json`：
+  >   > `bos_token_id=<|bos|>`，`eos_token_id=[<|bos|>, <|assistant_end|>]`（base 用文档边界
+  >   > `<|bos|>` 停、chat 用 `<|assistant_end|>` 停），`pad_token_id=<|bos|>`。
+  >   ```python
+  >   from transformers import AutoModelForCausalLM, AutoTokenizer
+  >   model = AutoModelForCausalLM.from_pretrained("hf_001000", trust_remote_code=True)
+  >   tok   = AutoTokenizer.from_pretrained("hf_001000")
+  >   ```
+  >   若只想要 safetensors 文件夹、不需要断点续训分片，用 `--save-format hf` 即可。
 - `--resume-from-step`、`--init-from`/`--init-step`、`--end-step`。
 - `--expand-from`/`--expand-from-step`：从更浅的 checkpoint 做深度扩展（function-preserving）。
 

@@ -121,7 +121,7 @@ parser.add_argument("--core-metric-every", type=int, default=5000, help="evaluat
 parser.add_argument("--core-metric-max-per-task", type=int, default=-1, help="examples per task for CORE metric")
 parser.add_argument("--sample-every", type=int, default=2000, help="sample from model every N steps (-1 = disable)")
 parser.add_argument("--save-every", type=int, default=-1, help="save checkpoints every N steps (-1 = only at end)")
-parser.add_argument("--save-format", type=str, default="pt", choices=["pt", "hf", "both"], help="checkpoint export format")
+parser.add_argument("--save-format", type=str, default="both", choices=["pt", "hf", "both"], help="checkpoint export format. 'pt' = nanochat resume-able .pt shards only; 'hf' = transformers-loadable safetensors folder only (save_pretrained + tokenizer, loadable via AutoModelForCausalLM.from_pretrained(dir, trust_remote_code=True)); 'both' (default) writes both.")
 # Output
 parser.add_argument("--model-tag", type=str, default=None, help="override model tag for checkpoint directory name")
 # Depth expansion (model growth)

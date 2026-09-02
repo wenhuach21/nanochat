@@ -94,13 +94,145 @@ def save_checkpoint(checkpoint_dir, step, model_data, optimizer_data, meta_data,
         _atomic_torch_save(_to_cpu(optimizer_data), optimizer_path)
         logger.info(f"Saved optimizer state to: {optimizer_path}")
 
+def _register_custom_model_for_auto_class(m):
+    """If `m` is a *custom* (remote-code) model whose class lives outside the installed
+    `transformers` package (e.g. nanochat's Qwen3.5 `Qwen3_5ForCausalLM`), register its
+    config + model classes for the transformers "auto" classes so that a subsequent
+    `save_pretrained` will:
+      * copy the standalone modeling/configuration `.py` files into the checkpoint folder, and
+      * write an `auto_map` into `config.json`.
+
+    This is what makes the exported folder loadable on any machine with just transformers via
+    `AutoModelForCausalLM.from_pretrained(save_dir, trust_remote_code=True)` (and likewise
+    `AutoConfig`). Built-in transformers models (e.g. `Qwen3ForCausalLM`) are left untouched.
+    """
+    model_module = type(m).__module__ or ""
+    is_custom = not model_module.startswith("transformers.")
+    if not is_custom:
+        return
+    cfg = getattr(m, "config", None)
+    cfg_cls = type(cfg) if cfg is not None else None
+    try:
+        if cfg_cls is not None and hasattr(cfg_cls, "register_for_auto_class"):
+            cfg_cls.register_for_auto_class()  # -> AutoConfig
+        if hasattr(type(m), "register_for_auto_class"):
+            type(m).register_for_auto_class("AutoModelForCausalLM")
+        logger.info(
+            f"Registered custom model {type(m).__name__} for auto classes "
+            f"(will copy modeling code + write auto_map for trust_remote_code loading)."
+        )
+    except Exception as e:  # pragma: no cover - best effort
+        logger.warning(f"Could not register custom model for auto class ({e}); "
+                       f"the exported folder may require the source package to load.")
+
+
+def _resolve_special_token_ids(tokenizer):
+    """Best-effort extract (bos_id, eos_ids, pad_id) from a nanochat tokenizer wrapper
+    (RustBPETokenizer / TransformersTokenizer, which expose get_bos_token_id / encode_special)
+    or a raw transformers tokenizer.
+
+    For nanochat models the document delimiter is `<|bos|>`, so for a *base* LM that is also the
+    natural stop token; we additionally include `<|assistant_end|>` (if present) so the same
+    export also stops correctly once chat-finetuned. eos is returned as a list of ids.
+    """
+    bos_id = None
+    eos_ids = None
+    pad_id = None
+    if hasattr(tokenizer, "get_bos_token_id") and hasattr(tokenizer, "encode_special"):
+        try:
+            bos_id = tokenizer.get_bos_token_id()
+        except Exception:
+            bos_id = None
+
+        def _sp(name):
+            try:
+                i = tokenizer.encode_special(name)
+                return int(i) if i is not None else None
+            except Exception:
+                return None
+
+        assistant_end = _sp("<|assistant_end|>")
+        eos_list = []
+        for i in (bos_id, assistant_end):
+            if i is not None and i not in eos_list:
+                eos_list.append(int(i))
+        eos_ids = eos_list or None
+        pad_id = int(bos_id) if bos_id is not None else None
+    else:
+        inner = getattr(tokenizer, "tokenizer", tokenizer)
+        bos_id = getattr(inner, "bos_token_id", None)
+        eos_ids = getattr(inner, "eos_token_id", None)
+        pad_id = getattr(inner, "pad_token_id", None)
+        if pad_id is None:
+            pad_id = bos_id
+    return (int(bos_id) if bos_id is not None else None), eos_ids, (int(pad_id) if pad_id is not None else None)
+
+
+def _sync_special_token_ids_into_model(m, tokenizer):
+    """Populate bos/eos/pad token ids on the model config + generation_config from the tokenizer
+    so the exported `config.json` and `generation_config.json` carry them (like the original HF
+    release), and `model.generate()` knows where to stop out of the box."""
+    if tokenizer is None:
+        return
+    bos_id, eos_ids, pad_id = _resolve_special_token_ids(tokenizer)
+    cfg = getattr(m, "config", None)
+    gen = getattr(m, "generation_config", None)
+    for obj in (cfg, gen):
+        if obj is None:
+            continue
+        if bos_id is not None:
+            obj.bos_token_id = bos_id
+        if eos_ids is not None:
+            obj.eos_token_id = eos_ids
+        if pad_id is not None:
+            obj.pad_token_id = pad_id
+    if gen is not None:
+        # It's no longer a bare copy of the model config now that we've set ids explicitly.
+        try:
+            gen._from_model_config = False
+        except Exception:
+            pass
+    logger.info(f"Synced special token ids into config/generation_config: "
+                f"bos={bos_id}, eos={eos_ids}, pad={pad_id}")
+
+
+def _save_tokenizer_into(save_dir, tokenizer):
+    """Save a tokenizer into `save_dir` in transformers format, handling nanochat wrappers.
+
+    Accepts either a raw transformers tokenizer (has `save_pretrained`), a nanochat wrapper
+    exposing an inner `.tokenizer` (e.g. `TransformersTokenizer`), or a wrapper exposing a
+    transformers-export `save_pretrained` (e.g. `RustBPETokenizer`). Ensures
+    `AutoTokenizer.from_pretrained(save_dir)` works.
+    """
+    if tokenizer is None:
+        return
+    # 1) nanochat wrapper around a real transformers tokenizer -> use the inner one directly
+    inner = getattr(tokenizer, "tokenizer", None)
+    if inner is not None and hasattr(inner, "save_pretrained"):
+        inner.save_pretrained(save_dir)
+        logger.info(f"Saved transformers-compatible tokenizer to: {save_dir}")
+        return
+    # 2) object that already knows how to export a transformers tokenizer folder
+    if hasattr(tokenizer, "save_pretrained"):
+        tokenizer.save_pretrained(save_dir)
+        logger.info(f"Saved transformers-compatible tokenizer to: {save_dir}")
+        return
+    logger.warning(
+        f"Tokenizer of type {type(tokenizer).__name__} could not be exported "
+        f"(no save_pretrained / inner .tokenizer); skipping."
+    )
+
+
 def save_hf_checkpoint(save_dir, model, tokenizer=None, optimizer_data=None, meta_data=None, dtype=None, safe_serialization=True):
     """Save a model (and optionally the tokenizer) in a transformers-compatible format.
 
     Produces `config.json` + `model.safetensors` (via `PreTrainedModel.save_pretrained`) so the
-    result is directly loadable with `AutoModelForCausalLM.from_pretrained(save_dir)`. When a
-    tokenizer is given it is exported via its `save_pretrained` into the same directory so
-    `AutoTokenizer.from_pretrained(save_dir)` works too.
+    result is directly loadable with `AutoModelForCausalLM.from_pretrained(save_dir)`. For custom
+    (remote-code) models such as nanochat's Qwen3.5 the standalone modeling/configuration `.py`
+    files are also copied into the folder and an `auto_map` is written into `config.json`, so the
+    folder loads with `AutoModelForCausalLM.from_pretrained(save_dir, trust_remote_code=True)` on
+    any machine with just transformers. When a tokenizer is given it is exported into the same
+    directory so `AutoTokenizer.from_pretrained(save_dir)` works too.
 
     Optionally also saves the optimizer state (`optim.pt`) and training metadata (`meta.json`)
     alongside the model so that training can still be resumed from an HF-format checkpoint
@@ -117,14 +249,15 @@ def save_hf_checkpoint(save_dir, model, tokenizer=None, optimizer_data=None, met
         )
     if dtype is not None:
         m = m.to(dtype)
+    # For custom models (e.g. Qwen3.5), register for auto class so save_pretrained copies the
+    # modeling code + writes auto_map (needed for trust_remote_code loading of the folder).
+    _register_custom_model_for_auto_class(m)
+    # Populate bos/eos/pad token ids from the tokenizer so the exported config.json /
+    # generation_config.json carry them (like the original HF release) and generate() can stop.
+    _sync_special_token_ids_into_model(m, tokenizer)
     m.save_pretrained(save_dir, safe_serialization=safe_serialization)
     logger.info(f"Saved transformers-compatible model to: {save_dir}")
-    if tokenizer is not None:
-        if hasattr(tokenizer, "save_pretrained"):
-            tokenizer.save_pretrained(save_dir)
-            logger.info(f"Saved transformers-compatible tokenizer to: {save_dir}")
-        else:
-            logger.warning(f"Tokenizer of type {type(tokenizer).__name__} has no save_pretrained; skipping.")
+    _save_tokenizer_into(save_dir, tokenizer)
     # Save optimizer/loop state so an HF checkpoint can also be resumed.
     if optimizer_data is not None:
         optim_path = os.path.join(save_dir, "optim.pt")
@@ -135,6 +268,91 @@ def save_hf_checkpoint(save_dir, model, tokenizer=None, optimizer_data=None, met
         with open(meta_path, "w", encoding="utf-8") as f:
             json.dump(meta_data, f, indent=2)
         logger.info(f"Saved metadata to: {meta_path}")
+
+
+def export_gpt_to_transformers(model, meta_or_config, save_dir, tokenizer=None, dtype=None, safe_serialization=True):
+    """Export a nanochat `GPT` model to a transformers-loadable directory.
+
+    Produces a self-contained checkpoint folder that can be loaded on any machine with only
+    `transformers` installed (no nanochat / flash-attn dependency)::
+
+        from transformers import AutoModelForCausalLM, AutoTokenizer
+        model = AutoModelForCausalLM.from_pretrained(save_dir, trust_remote_code=True)
+        tok   = AutoTokenizer.from_pretrained(save_dir)
+
+    Writes `config.json` + `model.safetensors` (via `save_pretrained`), copies the standalone
+    `modeling_nanochat.py` into the folder (with an `auto_map` in the config so `trust_remote_code`
+    works), and exports the tokenizer via its `save_pretrained` so `AutoTokenizer` works too.
+
+    Args:
+        model: the nanochat `GPT` model (may be wrapped in DDP / torch.compile; will be unwrapped).
+        meta_or_config: either the `GPTConfig` used to build the model, or a `meta_data` dict that
+            contains a "model_config" entry (as saved by the training scripts).
+        save_dir: output directory.
+        tokenizer: optional tokenizer exposing `save_pretrained(save_dir)` (e.g. nanochat RustBPETokenizer).
+        dtype: optional torch dtype to cast weights to before saving (e.g. torch.bfloat16).
+    """
+    from nanochat.modeling_nanochat import NanochatConfig, NanochatForCausalLM
+
+    os.makedirs(save_dir, exist_ok=True)
+
+    # Unwrap common wrappers: DDP (.module) and torch.compile (._orig_mod)
+    m = getattr(model, "module", model)
+    m = getattr(m, "_orig_mod", m)
+
+    # Resolve the GPTConfig (dataclass) whether we were handed a config or a meta dict
+    if isinstance(meta_or_config, dict) and "model_config" in meta_or_config:
+        gpt_cfg_kwargs = dict(meta_or_config["model_config"])
+    elif hasattr(meta_or_config, "__dict__") and hasattr(meta_or_config, "n_layer"):
+        gpt_cfg_kwargs = dict(meta_or_config.__dict__)
+    else:
+        gpt_cfg_kwargs = dict(meta_or_config)
+    _patch_missing_config_keys(gpt_cfg_kwargs)
+
+    # Grab the (possibly compiled) state dict and strip the torch.compile prefix
+    state_dict = m.state_dict()
+    state_dict = {k.removeprefix("_orig_mod."): v.detach().cpu() for k, v in state_dict.items()}
+    if dtype is not None:
+        state_dict = {k: (v.to(dtype) if v.is_floating_point() else v) for k, v in state_dict.items()}
+
+    # The embedding rows define the (padded) vocab size actually stored in the weights
+    padded_vocab_size = state_dict["transformer.wte.weight"].shape[0]
+
+    hf_config = NanochatConfig(
+        vocab_size=padded_vocab_size,
+        text_vocab_size=gpt_cfg_kwargs["vocab_size"],
+        n_layer=gpt_cfg_kwargs["n_layer"],
+        n_head=gpt_cfg_kwargs["n_head"],
+        n_kv_head=gpt_cfg_kwargs["n_kv_head"],
+        n_embd=gpt_cfg_kwargs["n_embd"],
+        sequence_len=gpt_cfg_kwargs["sequence_len"],
+        window_pattern=gpt_cfg_kwargs.get("window_pattern", "SSSL"),
+        architectures=["NanochatForCausalLM"],
+    )
+
+    # Build the HF model on meta then load weights via assign to avoid double memory
+    with torch.device("meta"):
+        hf_model = NanochatForCausalLM(hf_config)
+    hf_model.load_state_dict(state_dict, strict=True, assign=True)
+    if dtype is not None:
+        hf_model.config.torch_dtype = str(dtype).replace("torch.", "")
+
+    # Register for auto classes so save_pretrained copies modeling_nanochat.py + sets auto_map,
+    # making the folder loadable with AutoModelForCausalLM.from_pretrained(..., trust_remote_code=True)
+    NanochatConfig.register_for_auto_class()
+    NanochatForCausalLM.register_for_auto_class("AutoModelForCausalLM")
+
+    hf_model.save_pretrained(save_dir, safe_serialization=safe_serialization)
+    logger.info(f"Saved transformers-compatible nanochat model to: {save_dir}")
+
+    if tokenizer is not None:
+        if hasattr(tokenizer, "save_pretrained"):
+            tokenizer.save_pretrained(save_dir)
+            logger.info(f"Saved transformers-compatible tokenizer to: {save_dir}")
+        else:
+            logger.warning(f"Tokenizer of type {type(tokenizer).__name__} has no save_pretrained; skipping.")
+
+    return save_dir
 
 
 def _load_hf_state_dict(hf_dir, device):
