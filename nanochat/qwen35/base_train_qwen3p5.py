@@ -93,7 +93,7 @@ parser.add_argument("--mtp-weight", type=float, default=0.0, help="weight for MT
 # Logit softcap: softcap*tanh(x/softcap) applied during training then annealed away.
 parser.add_argument("--logit-softcap", type=float, default=15.0, help="logit softcap start value (0 disables softcap)")
 parser.add_argument("--logit-softcap-end", type=float, default=100.0, help="logit softcap end value (grows toward this while annealing)")
-parser.add_argument("--logit-softcap-anneal-steps", type=int, default=2000, help="steps over which the softcap anneals away. Set -1 to freeze the softcap at --logit-softcap (e.g. constant 15) forever.")
+parser.add_argument("--logit-softcap-anneal-steps", type=int, default=-1, help="steps over which the softcap anneals away. Set -1 to freeze the softcap at --logit-softcap (e.g. constant 15) forever.")
 # DFLASH joint pretraining (block-diffusion draft trained online with the base model)
 parser.add_argument("--dflash-enable", action="store_true", help="train a DFLASH draft jointly during pretraining")
 parser.add_argument("--dflash-layers", type=int, default=1, help="number of DFLASH draft decoder layers")
