@@ -164,24 +164,53 @@ print0(f"Tokenizer backend: {args.tokenizer_backend}")
 vocab_size = tokenizer.get_vocab_size()
 print0(f"Vocab size: {vocab_size:,}")
 # -----------------------------------------------------------------------------
-def build_model_meta(depth, hidden_size_override=None, num_kv_heads_override=None):
+def build_model_meta(
+    depth,
+    hidden_size_override=None,
+    num_kv_heads_override=None,
+    head_dim_override=None,
+    num_attention_heads_override=None,
+    intermediate_size_override=None,
+    linear_key_head_dim_override=None,
+    linear_value_head_dim_override=None,
+    linear_num_key_heads_override=None,
+    linear_num_value_heads_override=None,
+):
     from nanochat.qwen35 import Qwen3_5TextConfig, Qwen3_5ForCausalLM
     layers = depth
     hidden_size = hidden_size_override if hidden_size_override is not None else args.hidden_size
-    head_dim = args.head_dim
-    num_attention_heads = args.num_attention_heads if args.num_attention_heads > 0 else hidden_size // head_dim
+    head_dim = head_dim_override if head_dim_override is not None else args.head_dim
+    if num_attention_heads_override is not None:
+        num_attention_heads = num_attention_heads_override
+    else:
+        num_attention_heads = args.num_attention_heads if args.num_attention_heads > 0 else hidden_size // head_dim
     num_kv_heads = num_kv_heads_override if num_kv_heads_override is not None else (args.num_kv_heads if args.num_kv_heads > 0 else num_attention_heads)
-    intermediate_size = args.intermediate_size if args.intermediate_size > 0 else hidden_size * 3
+    if intermediate_size_override is not None:
+        intermediate_size = intermediate_size_override
+    else:
+        intermediate_size = args.intermediate_size if args.intermediate_size > 0 else hidden_size * 3
     # GatedDeltaNet (linear attention) head configuration. These are decoupled from the
     # softmax-attention head_dim / num_kv_heads; each override defaults to the previous
     # derive-from-attention behavior when left at -1.
-    linear_key_head_dim = args.linear_key_head_dim if args.linear_key_head_dim > 0 else head_dim
-    linear_value_head_dim = args.linear_value_head_dim if args.linear_value_head_dim > 0 else head_dim
-    linear_num_key_heads = args.linear_num_key_heads if args.linear_num_key_heads > 0 else num_kv_heads
-    linear_num_value_heads = (
-        args.linear_num_value_heads if args.linear_num_value_heads > 0
-        else max(1, args.linear_num_value_mult) * num_kv_heads
-    )
+    if linear_key_head_dim_override is not None:
+        linear_key_head_dim = linear_key_head_dim_override
+    else:
+        linear_key_head_dim = args.linear_key_head_dim if args.linear_key_head_dim > 0 else head_dim
+    if linear_value_head_dim_override is not None:
+        linear_value_head_dim = linear_value_head_dim_override
+    else:
+        linear_value_head_dim = args.linear_value_head_dim if args.linear_value_head_dim > 0 else head_dim
+    if linear_num_key_heads_override is not None:
+        linear_num_key_heads = linear_num_key_heads_override
+    else:
+        linear_num_key_heads = args.linear_num_key_heads if args.linear_num_key_heads > 0 else num_kv_heads
+    if linear_num_value_heads_override is not None:
+        linear_num_value_heads = linear_num_value_heads_override
+    else:
+        linear_num_value_heads = (
+            args.linear_num_value_heads if args.linear_num_value_heads > 0
+            else max(1, args.linear_num_value_mult) * num_kv_heads
+        )
     config = Qwen3_5TextConfig(
         vocab_size=vocab_size,
         hidden_size=hidden_size,
@@ -421,7 +450,23 @@ print0(f"Parameters: {num_params/1e9:.3f}B")
 
 target_tokens = int(args.target_param_data_ratio * num_params)
 B_REF = 256 * 2048
-d_ref_model = build_model_meta(28, hidden_size_override=1024)
+# Scaling-law reference model = the ~0.8B Qwen3.5 config we tune hyperparameters on.
+# HPs are searched on 0.8B and transferred to larger models (e.g. 2B), so D_REF must be
+# the param ratio relative to this FIXED 0.8B reference, independent of the current run's
+# args (otherwise, e.g. running the 2B sweep would build a wrong reference from 2B args
+# and mis-scale batch size / weight decay). Keep in sync with run_sweep_3p5_0p8b.py.
+d_ref_model = build_model_meta(
+    24,
+    hidden_size_override=1024,
+    head_dim_override=256,
+    num_attention_heads_override=8,
+    num_kv_heads_override=2,
+    intermediate_size_override=3584,
+    linear_key_head_dim_override=128,
+    linear_value_head_dim_override=128,
+    linear_num_key_heads_override=16,
+    linear_num_value_heads_override=16,
+)
 d_ref_params = sum(p.numel() for p in d_ref_model.parameters())
 D_REF = num_params / d_ref_params
 del d_ref_model
