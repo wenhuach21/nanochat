@@ -19,12 +19,11 @@ torchrun --standalone --nproc_per_node=8 -m scripts.chat_rl -- --run=default
 import argparse
 import os
 import itertools
-import wandb
 import torch
 import torch.distributed as dist
 from contextlib import nullcontext
 
-from nanochat.common import compute_init, compute_cleanup, print0, get_base_dir, DummyWandb, autodetect_device_type
+from nanochat.common import compute_init, compute_cleanup, print0, get_base_dir, autodetect_device_type, init_tracker, TRACKING_BACKENDS
 from nanochat.checkpoint_manager import save_checkpoint, load_model
 from nanochat.engine import Engine
 from tasks.gsm8k import GSM8K
@@ -33,7 +32,8 @@ from tasks.gsm8k import GSM8K
 # CLI arguments
 parser = argparse.ArgumentParser(description="Reinforcement learning on GSM8K")
 # Logging
-parser.add_argument("--run", type=str, default="dummy", help="wandb run name ('dummy' disables wandb logging)")
+parser.add_argument("--run", type=str, default="dummy", help="tracking run name ('dummy' disables experiment logging)")
+parser.add_argument("--tracker", type=str, default="swanlab", choices=TRACKING_BACKENDS, help="experiment tracking backend (default: swanlab)")
 # Runtime
 parser.add_argument("--device-type", type=str, default="", help="cuda|cpu|mps (empty = autodetect)")
 parser.add_argument("--dtype", type=str, default="bfloat16", help="float32|bfloat16")
@@ -71,9 +71,7 @@ master_process = ddp_rank == 0 # this process will do logging, checkpointing etc
 ptdtype = torch.float32 if args.dtype == 'float32' else torch.bfloat16
 autocast_ctx = torch.amp.autocast(device_type=device_type, dtype=ptdtype) if device_type == "cuda" else nullcontext()
 
-# wandb logging init
-use_dummy_wandb = args.run == "dummy" or not master_process
-wandb_run = DummyWandb() if use_dummy_wandb else wandb.init(project="nanochat-rl", name=args.run, config=user_config)
+tracker = init_tracker("nanochat-rl", args.run, user_config, backend=args.tracker, enabled=master_process)
 
 # Init model and tokenizer
 model, tokenizer, meta = load_model("sft", device, phase="eval", model_tag=args.model_tag, step=args.model_step)
@@ -244,7 +242,7 @@ for step in range(num_steps):
         print_passk = [f"Pass@{k}: {passk[k - 1].item():.4f}" for k in range(1, args.device_batch_size + 1)]
         print0(f"Step {step} | {', '.join(print_passk)}")
         log_passk = {f"pass@{k}": passk[k - 1].item() for k in range(1, args.device_batch_size + 1)}
-        wandb_run.log({
+        tracker.log({
             "step": step,
             **log_passk,
         })
@@ -295,7 +293,7 @@ for step in range(num_steps):
         mean_reward = mean_reward_tensor.item()
         mean_sequence_length = mean_sequence_length_tensor.item()
     print0(f"Step {step}/{num_steps} | Average reward: {mean_reward} | Average sequence length: {mean_sequence_length:.2f}")
-    wandb_run.log({
+    tracker.log({
         "step": step,
         "reward": mean_reward,
         "sequence_length": mean_sequence_length,
@@ -307,7 +305,7 @@ for step in range(num_steps):
         group["lr"] = group["initial_lr"] * lrm
     optimizer.step()
     model.zero_grad(set_to_none=True)
-    wandb_run.log({
+        tracker.log({
         "step": step,
         "lrm": lrm,
     })
@@ -336,5 +334,5 @@ get_report().log(section="Chat RL", data=[
     user_config, # CLI args
 ])
 
-wandb_run.finish() # wandb run finish
+tracker.finish()
 compute_cleanup()

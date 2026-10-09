@@ -192,14 +192,29 @@ def compute_cleanup():
     if is_ddp_initialized():
         dist.destroy_process_group()
 
-class DummyWandb:
-    """Useful if we wish to not use wandb but have all the same signatures"""
-    def __init__(self):
-        pass
+class DummyTracker:
+    """No-op experiment tracker for disabled logging and non-master processes."""
     def log(self, *args, **kwargs):
         pass
     def finish(self):
         pass
+
+# Backward compatibility for code importing the old helper directly.
+DummyWandb = DummyTracker
+
+TRACKING_BACKENDS = ("swanlab", "wandb")
+
+def init_tracker(project, run_name, config, backend="swanlab", enabled=True):
+    """Initialize an experiment tracker, importing its SDK only when enabled."""
+    if not enabled or run_name == "dummy":
+        return DummyTracker()
+    if backend == "swanlab":
+        import swanlab
+        return swanlab.init(project=project, name=run_name, config=config)
+    if backend == "wandb":
+        import wandb
+        return wandb.init(project=project, name=run_name, config=config)
+    raise ValueError(f"Unknown tracking backend {backend!r}; choose from {TRACKING_BACKENDS}")
 
 # hardcoded BF16 peak flops for various GPUs
 # inspired by torchtitan: https://github.com/pytorch/torchtitan/blob/main/torchtitan/tools/utils.py

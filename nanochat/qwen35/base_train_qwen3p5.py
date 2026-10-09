@@ -26,12 +26,11 @@ import math
 import argparse
 from contextlib import nullcontext, contextmanager
 
-import wandb
 import torch
 import torch.nn.functional as F
 
 from nanochat.dataloader import tokenizing_distributed_data_loader_bos_bestfit, tokenizing_distributed_data_loader_with_state_bos_bestfit
-from nanochat.common import compute_init, compute_cleanup, print0, DummyWandb, print_banner, get_base_dir, autodetect_device_type, get_peak_flops
+from nanochat.common import compute_init, compute_cleanup, print0, print_banner, get_base_dir, autodetect_device_type, get_peak_flops, init_tracker, TRACKING_BACKENDS
 from nanochat.tokenizer import get_tokenizer, get_token_bytes
 from nanochat.checkpoint_manager import save_checkpoint, load_checkpoint, save_hf_checkpoint, load_checkpoint_any
 from nanochat.loss_eval import evaluate_bpb
@@ -44,7 +43,8 @@ print_banner()
 # CLI arguments
 parser = argparse.ArgumentParser(description="Pretrain Qwen3.5 text-only base model")
 # Logging
-parser.add_argument("--run", type=str, default="dummy", help="wandb run name ('dummy' disables wandb logging)")
+parser.add_argument("--run", type=str, default="dummy", help="tracking run name ('dummy' disables experiment logging)")
+parser.add_argument("--tracker", type=str, default="swanlab", choices=TRACKING_BACKENDS, help="experiment tracking backend (default: swanlab)")
 # Runtime
 parser.add_argument("--device-type", type=str, default="", help="cuda|cpu|mps (empty = autodetect)")
 # Data
@@ -130,7 +130,7 @@ parser.add_argument("--expand-from-step", type=int, default=-1, help="step of th
 args = parser.parse_args()
 user_config = vars(args).copy()  # for logging
 # -----------------------------------------------------------------------------
-# Compute init and wandb logging
+# Compute init and experiment logging
 
 device_type = autodetect_device_type() if args.device_type == "" else args.device_type
 ddp, ddp_rank, ddp_local_rank, ddp_world_size, device = compute_init(device_type)
@@ -145,8 +145,7 @@ if device_type == "cuda":
 else:
     gpu_peak_flops = float('inf')
 
-use_dummy_wandb = args.run == "dummy" or not master_process
-wandb_run = DummyWandb() if use_dummy_wandb else wandb.init(project="nanochat", name=args.run, config=user_config)
+tracker = init_tracker("nanochat", args.run, user_config, backend=args.tracker, enabled=master_process)
 
 if HAS_FA3:
     print0("✓ Using Flash Attention 3 (Hopper GPU detected), efficient, new and awesome.")
@@ -735,7 +734,7 @@ while True:
             with autocast_ctx:
                 results = evaluate_core(orig_model, tokenizer, device, max_per_task=args.core_metric_max_per_task)
         print0(f"Step {step:05d} | CORE metric: {results['core_metric']:.4f}")
-        wandb_run.log({
+        tracker.log({
             "step": step,
             "total_training_flops": flops_so_far,
             "core_metric": results["core_metric"],
@@ -919,7 +918,7 @@ while True:
     epoch = dataloader_state_dict["epoch"]
     print0(f"step {step:05d}/{num_iterations:05d} ({pct_done:.2f}%) | loss: {debiased_smooth_loss:.6f} | lrm: {lrm:.2f} | dt: {dt * 1000:.2f}ms | tok/sec: {tok_per_sec:,} | bf16_mfu: {mfu:.2f} | epoch: {epoch} | total time: {total_training_time/60:.2f}m{eta_str}")
     if step % 100 == 0:
-        wandb_run.log({
+        tracker.log({
             "step": step,
             "total_training_flops": flops_so_far,
             "total_training_time": total_training_time,
@@ -968,6 +967,6 @@ get_report().log(section="Qwen3.5 base model training", data=[
     }
 ])
 
-wandb_run.finish()
+tracker.finish()
 compute_cleanup()
 
