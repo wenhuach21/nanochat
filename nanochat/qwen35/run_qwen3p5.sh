@@ -22,6 +22,9 @@ torchrun --standalone --nproc_per_node="${NPROC}" \
     --run=qwen3p5 \
     --model-tag=qwen3p5-d28 \
     --tokenizer-backend=transformers \
+    --fp8 \
+    --fp8-recipe=tensorwise \
+    --compile \
     --depth=28 \
     --hidden-size=1024 \
     --head-dim=128 \

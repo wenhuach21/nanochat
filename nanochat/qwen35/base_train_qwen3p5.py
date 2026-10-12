@@ -47,6 +47,9 @@ parser.add_argument("--run", type=str, default="dummy", help="tracking run name 
 parser.add_argument("--tracker", type=str, default="swanlab", choices=TRACKING_BACKENDS, help="experiment tracking backend (default: swanlab)")
 # Runtime
 parser.add_argument("--device-type", type=str, default="", help="cuda|cpu|mps (empty = autodetect)")
+parser.add_argument("--compile", dest="compile_model", action="store_true", help="compile the main training model with torch.compile(dynamic=False)")
+parser.add_argument("--fp8", action="store_true", help="use FP8 GEMMs for eligible Linear layers (requires an FP8-capable CUDA GPU)")
+parser.add_argument("--fp8-recipe", type=str, default="tensorwise", choices=["tensorwise"], help="FP8 scaling recipe (the built-in implementation supports tensorwise scaling)")
 # Data
 parser.add_argument("--data-dir", type=str, default="", help="data directory path. Use colon-separated (semicolon on Windows) paths to mix datasets. Empty = default fineweb-edu-100b-shuffle.")
 parser.add_argument("--shuffle-files", action="store_true", default=True, help="shuffle parquet file order each epoch (recommended when mixing multiple data sources)")
@@ -371,6 +374,59 @@ elif args.init_from:
     del init_model_data
 
 # -----------------------------------------------------------------------------
+# FP8 conversion must happen after checkpoint loading and before optimizer
+# construction, torch.compile, and DDP wrapping.
+if args.fp8:
+    if device_type != "cuda":
+        raise RuntimeError("--fp8 was requested, but FP8 training requires a CUDA GPU")
+    if not hasattr(torch, "_scaled_mm"):
+        raise RuntimeError("--fp8 was requested, but this PyTorch build has no torch._scaled_mm")
+
+    import torch.nn as nn
+    from nanochat.fp8 import Float8Linear, Float8LinearConfig, convert_to_float8_training
+
+    # Execute the same FP8 forward and two backward GEMMs used during training.
+    # This fails early on unsupported GPUs/builds instead of printing a false
+    # "enabled" message and failing much later in the first training step.
+    try:
+        probe_linear = nn.Linear(128, 128, bias=False, device=device)
+        probe = Float8Linear.from_float(probe_linear)
+        probe_input = torch.randn(16, 128, device=device, dtype=torch.bfloat16, requires_grad=True)
+        with autocast_ctx:
+            probe(probe_input).square().mean().backward()
+        synchronize()
+    except Exception as exc:
+        capability = torch.cuda.get_device_capability(device)
+        raise RuntimeError(
+            f"--fp8 was requested, but the FP8 forward/backward kernel probe failed "
+            f"on {torch.cuda.get_device_name(device)} (compute capability {capability[0]}.{capability[1]})."
+        ) from exc
+    finally:
+        if "probe" in locals():
+            del probe, probe_linear, probe_input
+
+    def fp8_module_filter(mod: nn.Module, fqn: str) -> bool:
+        """Select Linear shapes accepted by the hardware FP8 GEMM kernels."""
+        return (
+            isinstance(mod, nn.Linear)
+            and mod.in_features % 16 == 0
+            and mod.out_features % 16 == 0
+            and min(mod.in_features, mod.out_features) >= 128
+        )
+
+    fp8_config = Float8LinearConfig.from_recipe_name(args.fp8_recipe)
+    num_linear = sum(isinstance(module, nn.Linear) for module in model.modules())
+    convert_to_float8_training(model, config=fp8_config, module_filter_fn=fp8_module_filter)
+    fp8_names = [name for name, module in model.named_modules() if isinstance(module, Float8Linear)]
+    if not fp8_names:
+        raise RuntimeError("--fp8 was requested, but no eligible Linear layers were converted")
+    print0(
+        f"✓ FP8 ACTIVE ({args.fp8_recipe}): kernel forward/backward probe passed; "
+        f"converted {len(fp8_names)}/{num_linear} Linear layers"
+    )
+    print0(f"  FP8 modules (first 8): {', '.join(fp8_names[:8])}")
+
+# -----------------------------------------------------------------------------
 # EMA helpers
 
 def init_ema_state(model):
@@ -404,6 +460,11 @@ def apply_ema_weights(model, ema_state):
 
 # -----------------------------------------------------------------------------
 orig_model = model  # uncompiled model, for saving/eval/inference
+if args.compile_model:
+    model = torch.compile(model, dynamic=False)
+    if not hasattr(model, "_orig_mod"):
+        raise RuntimeError("--compile was requested, but torch.compile did not return a compiled module")
+    print0("✓ torch.compile ACTIVE (dynamic=False; graph compilation occurs on first forward)")
 print0(orig_model.dtype)
 
 if ddp:

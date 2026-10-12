@@ -27,6 +27,7 @@ nanochat/qwen35/
 - 一个较新的 `transformers`（本包在 `transformers==5.15.x` 上验证通过；旧版本会走内置兼容 shim，
   但 Qwen3.5 的加速 kernel 需要新版）。
 - PyTorch（Muon 优化器需要带 `torch.optim.Muon` 的版本；否则用 `--optimizer-mode adamw`）。
+- FP8 训练需要支持 FP8 Tensor Core 的 CUDA GPU（如 H100/H800）；不支持的设备请勿传 `--fp8`。
 - 数据集：nanochat 默认的 fineweb-edu 数据（见仓库根 `README.md` 的数据准备说明）。
 
 所有命令都从**仓库根目录**执行。
@@ -120,6 +121,7 @@ torchrun --standalone --nproc_per_node=4 \
     --depth=14 \
     --hidden-size=1024 \
     --head-dim=128 \
+    --fp8 --fp8-recipe=tensorwise --compile \
     --device-batch-size=16 \
     --total-batch-size=524288 \
     --target-param-data-ratio=12 \
@@ -133,6 +135,8 @@ torchrun --standalone --nproc_per_node=4 \
 ```bash
 bash nanochat/qwen35/run_qwen3p5.sh
 ```
+
+`run_qwen3p5.sh` 已默认传入 `--fp8 --fp8-recipe=tensorwise --compile`。FP8 只替换输入/输出维度满足硬件约束的 `Linear` 层，权重和优化器状态仍保持原精度；评估和采样会临时切回 BF16 Linear。`torch.compile` 首步有一次编译开销，后续固定形状的训练 step 会复用编译图。CPU 冒烟测试不要传 `--fp8`，可按需单独传 `--compile`。
 
 ### 2.3 关键参数
 
@@ -160,6 +164,11 @@ bash nanochat/qwen35/run_qwen3p5.sh
 - `--warmup-ratio` / `--warmdown-ratio` / `--final-lr-frac` / `--lr-schedule`。
 - `--grad-max-norm`、`--ema-decay` / `--ema-eval`。
 - `--mtp-num-heads` / `--mtp-weight`：可选的 MTP 辅助 loss。
+
+训练加速：
+- `--fp8`：启用 FP8 Linear 训练（需要支持 FP8 的 CUDA GPU）。
+- `--fp8-recipe tensorwise`：使用内置的逐张量动态缩放实现。
+- `--compile`：以 `torch.compile(dynamic=False)` 编译主训练模型；应保持每个 micro-batch 的 shape 固定。
 
 评估 / 保存 / 断点续训：
 - `--core-metric-every`、`--core-metric-max-per-task`、`--sample-every`。
